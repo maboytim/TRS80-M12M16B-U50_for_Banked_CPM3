@@ -1,0 +1,80 @@
+Inputs:
+
+1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 17, 18, 19
+
+Outputs:
+
+12 (Combinatorial, Output feedback output, Active low)
+14 (Combinatorial, Output feedback output, Active high)
+15 (Combinatorial, Output feedback output, Active high)
+16 (Combinatorial, Output feedback output, Active high)
+17 (Combinatorial, Output feedback output, Active high)
+
+Equations:
+
+/o12 = /i1 & /i2 & /i18 & /i19
+o12.oe = vcc
+
+o14 = /i1 & /i2 & /i7 & i9 & /i18 & /i19
+o14.oe = vcc
+
+o15 = /i5 & /i7 & /i18 +
+      /i5 & /i7 & /i18 & i19 +
+      i1 & /i5 & /i7 & /i18 +
+      i2 & /i5 & /i7 & /i18 +
+      i4 & /i5 & /i7 & /i8 & /i11 & i18 +
+      i4 & /i5 & /i7 & /i11 & i18 & /i19 +
+      /i1 & i4 & /i5 & /i7 & /i11 & i18 +
+      /i2 & i4 & /i5 & /i7 & /i11 & i18 +
+      /i3 & i4 & /i5 & /i7 & /i11 & i18 +
+      i4 & i5 & /i7 & /i11 & i18 +
+      i4 & i5 & /i7 & /i11 & /i18 & i19 +
+      i1 & i4 & i5 & /i7 & /i11 & /i18 +
+      i2 & i4 & i5 & /i7 & /i11 & /i18 +
+      i5 & /i7 & /i8 & i18 +
+      i5 & /i7 & i18 & /i19 +
+      /i1 & i5 & /i7 & i18 +
+      /i2 & i5 & /i7 & i18 +
+      /i3 & i5 & /i7 & i18 +
+      /i5 & /i7 & /i13 & i18 & /i19 +
+      /i5 & /i6 & /i7 & /i8 & /i13 & i18 +
+      /i1 & /i5 & /i6 & /i7 & /i13 & i18 +
+      /i2 & /i5 & /i6 & /i7 & /i13 & i18 +
+      /i3 & /i5 & /i6 & /i7 & /i13 & i18 +
+      i5 & /i6 & /i7 & /i13 & /i18 +
+      i5 & /i6 & /i7 & /i13 & /i18 & /i19 +
+      /i1 & i5 & /i6 & /i7 & /i13 & /i18 +
+      /i2 & i5 & /i6 & /i7 & /i13 & /i18
+o15.oe = vcc
+
+o16 = /i5 & /i7 & /i13 & i18 & /i19 +
+      /i5 & /i6 & /i7 & /i8 & /i13 & i18 +
+      /i1 & /i5 & /i6 & /i7 & /i13 & i18 +
+      /i2 & /i5 & /i6 & /i7 & /i13 & i18 +
+      /i3 & /i5 & /i6 & /i7 & /i13 & i18 +
+      i5 & /i6 & /i7 & /i13 & /i18 +
+      i5 & /i6 & /i7 & /i13 & /i18 & /i19 +
+      /i1 & i5 & /i6 & /i7 & /i13 & /i18 +
+      /i2 & i5 & /i6 & /i7 & /i13 & /i18
+o16.oe = vcc
+
+o17 = /i5 & /i7 & /i18 +
+      /i5 & /i7 & /i18 & i19 +
+      i1 & /i5 & /i7 & /i18 +
+      i2 & /i5 & /i7 & /i18 +
+      i4 & /i5 & /i7 & /i8 & /i11 & i18 +
+      i4 & /i5 & /i7 & /i11 & i18 & /i19 +
+      /i1 & i4 & /i5 & /i7 & /i11 & i18 +
+      /i2 & i4 & /i5 & /i7 & /i11 & i18 +
+      /i3 & i4 & /i5 & /i7 & /i11 & i18 +
+      i4 & i5 & /i7 & /i11 & i18 +
+      i4 & i5 & /i7 & /i11 & /i18 & i19 +
+      i1 & i4 & i5 & /i7 & /i11 & /i18 +
+      i2 & i4 & i5 & /i7 & /i11 & /i18 +
+      i5 & /i7 & /i8 & i18 +
+      i5 & /i7 & i18 & /i19 +
+      /i1 & i5 & /i7 & i18 +
+      /i2 & i5 & /i7 & i18 +
+      /i3 & i5 & /i7 & i18
+o17.oe = vcc
+

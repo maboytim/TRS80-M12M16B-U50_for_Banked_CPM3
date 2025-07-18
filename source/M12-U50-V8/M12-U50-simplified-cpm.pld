@@ -1,0 +1,62 @@
+Name     M12-U50 ;
+PartNo   ATF16V8B ;
+Date     6/22/25 ;
+Revision 01 ;
+Designer Engineer ;
+Company  none ;
+Assembly None ;
+Location  ;
+Device   g16v8 ;
+
+/* Inputs: */
+
+PIN 1    = MA13;
+PIN 2    = MA12;
+PIN 3    = MA11;
+PIN 4    = PAGE; /* port_FF[0] */
+PIN 5    = LOW_PAGE; /* port_A8[0] */
+PIN 6    = K16x;
+PIN 7    = REFRESH;
+PIN 8    = VIDEO;
+PIN 9    = ROM;
+PIN 11   = !BANK0; /* port_FF[3:1]==0 */
+PIN 13   = !BANKSEL; /* port_FF[3:1]==SEL where SEL is the jumper-selected bank 1-7 */
+PIN 18   = MA15;
+PIN 19   = MA14;
+
+/* Outputs: */
+
+PIN 12   = !ROMAD;
+PIN 14   = ROMSEL;
+PIN 15   = !CASEN;
+PIN 16   = !RASEN1;
+PIN 17   = !RASEN0;
+
+/* Equations: */
+
+K16 = K16x & !K16x;
+
+ROMAD = !MA15 & !MA14 & !MA13 & !MA12;
+
+ROMSEL = !REFRESH & ROM & !MA15 & !MA14 & !MA13 & !MA12;
+
+/* Memory Page 1, 0 Selected */
+PAGE1 = BANK0 &  PAGE;
+PAGE0 = BANK0 & !PAGE;
+
+/* Video Memory Selected */
+VID = VIDEO & MA14 & MA13 & MA12 & MA11;
+
+/* LOW_PAGE=0 */
+R0_0 = !LOW_PAGE & ( (!MA15 &  'b'1) #
+                     ( MA15 &  PAGE1 &   !VID) );
+R1_0 = !LOW_PAGE &     MA15 &  BANKSEL & !VID & (!MA14 # !K16);
+
+/* LOW_PAGE=1 */
+R0_1 =  LOW_PAGE & ( (!MA15 &  PAGE0) #
+                     ( MA15 &            !VID) );
+R1_1 =  LOW_PAGE &    !MA15 &  BANKSEL & !K16;
+
+RASEN0 = !REFRESH & (R0_0 # R0_1);
+RASEN1 = !REFRESH & (R1_0 # R1_1);
+CASEN =  !REFRESH & ((R0_0 # R1_0) # (R0_1 # R1_1));
