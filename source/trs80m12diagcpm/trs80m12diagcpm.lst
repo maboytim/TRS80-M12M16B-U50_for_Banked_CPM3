@@ -1,0 +1,2837 @@
+   1:				; code: language=asm-collection tabSize=8
+   2:				
+   3:				; configuration defines:
+   4:				; Whether to continue to DRAM testing after finding VRAM error.  This can be used
+   5:				; to work on DRAM if you know the VRAM is bad, but you don't have replacement chips
+   6:				; on hand and want to test DRAM chips too.  By default the released builds stop 
+   7:				; if there is a VRAM error and try to display a character test pattern on the screen.
+   8:     -	0000          	CONTINUE_ON_VRAM_ERROR = 0
+   9:				
+  10:				; For debugging in an emulator, you can choose a page number to simulate a bit error
+  11:				; while testing.
+  12:     -	0000          	SIMULATE_ERROR = 0
+  13:				; SIMULATE_ERROR = $80
+  14:				; SIMULATE_ERROR = $3C
+  15:				
+  16:     -	F800          	VBASE  equ $F800
+  17:     -	0800          	VSIZE  equ $0800
+  18:     -	0050          	VLINE  equ 80
+  19:				
+  20:				.include "inc/z80.mac"
+**** inc/z80.mac ****
+   1:				; code: lang=asm-collection tabSize=8
+   2:				
+   3:     -	0000          	JP_ERROR defl 0
+   4:     -	0000          	JR_PROMOTE defl 0
+   5:				
+   6:					.jperror JP_ERROR
+   7:					.jrpromote JR_PROMOTE
+   8:				
+   9:				dbi .macro string
+  10:					irpc char,<string>
+  11:						db	'`char`'|$80
+  12:					.endm
+  13:				.endm
+  14:				
+  15:				dbz .macro string
+  16:						db "`string`", 0
+  17:				.endm
+  18:				
+  19:				dbiz .macro string
+  20:						dbi "`string`"
+  21:						db 0
+  22:				.endm
+  23:				
+  24:				nop12 .macro
+  25:						jr	$+2
+  26:				.endm
+  27:				
+  28:				
+  29:				; interrupt vectors: these need to be located at 38h and 66h, so there is little
+  30:				; code space before them.  They should probably be present so that any incoming interrupts
+  31:				; won't kill the test routines.  The INT vector is probably unnecessary but the NMI should
+  32:				; be present.
+  33:				
+  34:				; to maximize space, 
+  35:				
+  36:				PLACE_VEC .macro loc
+  37:						.assert $ <= loc
+  38:						.if $ < loc
+  39:						dc	loc-$,$FF
+  40:						.endif
+  41:						org	loc
+  42:				.endm
+  43:				
+  44:				; PLACE_INTVEC .macro
+  45:				; 		.assert $ <= $38
+  46:				; 		.if $ < $38
+  47:				; 		dc 	$38-$,$FF				; fill empty space
+  48:				; 		.endif
+  49:				; 		org 	$38					; NMI vector
+  50:				; .endm
+  51:				
+  52:				; PLACE_NMIVEC .macro
+  53:				; 		.assert $ <= $66
+  54:				; 		.if $ < $66
+  55:				; 		dc 	$66-$,$FF				; fill empty space
+  56:				; 		.endif
+  57:				; 		org 	$66					; NMI vector
+  58:				; .endm
+  59:				
+  60:				SKIP_INTVEC .macro
+  61:						jr	.intvec_continue			; continue after the NMI vector
+  62:						PLACE_INTVEC
+  63:						reti
+  64:					.intvec_continue:
+  65:				.endm
+  66:				
+  67:				SKIP_NMIVEC .macro
+  68:						jr	.nmivec_continue			; continue after the NMI vector
+  69:						; PLACE_NMIVEC
+  70:						PLACE_VEC $66
+  71:						retn
+  72:					.nmivec_continue:
+**** trs80m12diagcpm.asm ****
+  21:				.endm
+  22:				.include "inc/spt.mac"
+**** inc/spt.mac ****
+   1:				; code: lang=asm-collection tabSize=8
+   2:				; macros for placing interrupt vectors in the middle of a block of threaded code
+   3:				SPT_SKIP_INTVEC .macro
+   4:						dw spt_jp, .intvec_continue			; continue after the NMI vector
+   5:						PLACE_INTVEC
+   6:						; ld	sp,0
+   7:						reti
+   8:					.intvec_continue:
+   9:				.endm
+  10:				
+  11:				SPT_SKIP_NMIVEC .macro
+  12:						dw spt_jp, .nmivec_continue			; continue after the NMI vector
+  13:						; PLACE_NMIVEC
+  14:						PLACE_VEC $66
+  15:						; ld	sp,0					; on model 1, NMI is connected to reset button
+  16:						retn
+  17:					.nmivec_continue:
+  18:				.endm
+  19:				
+  20:				; Start a threaded-code section by pointing to it with SP and issuing RET
+  21:				; immediately following this macro should be the addresses (and optionally,
+  22:				; parameters) for the threaded code
+  23:				SPTHREAD_BEGIN .macro
+  24:					.local threadstart
+  25:						ld	sp,.`threadstart
+  26:						ret
+  27:					.`threadstart:
+  28:				.endm
+  29:				
+  30:				; At the end of the threaded code section, place an address just beyond
+  31:				; the list of addresses, to jump back to conventional code
+  32:				SPTHREAD_END .macro
+  33:						dw	$+2
+  34:				.endm
+  35:				
+  36:				; Save the stack pointer into the stack registers.  This is analogous
+  37:				; to pushing SP onto the (simulated) stack.  The shadow registers hold
+  38:				; two copies of SP, and effectively become a 2-element stack.  This means
+  39:				; that there can be up to two threaded code stack frames saved.  The
+  40:				; innermost threaded stack frame can call a third-level machine-code
+  41:				; subroutine, but that subroutine can't make any further calls or run
+  42:				; threaded code itself.
+  43:				SPTHREAD_SAVE .macro
+  44:						exx
+  45:						ex	af,af'		; save flags because of the add hl,sp instruction
+  46:						ex	de,hl
+  47:						ld	hl,0		; copy old sp to iy
+  48:						add	hl,sp
+  49:						ex	af,af'
+  50:						exx
+  51:				.endm
+  52:				
+  53:				; The opposite of SPTHREAD_SAVE.  Pops SP off the simulated stack in
+  54:				; preparation for returning to the enclosing threaded stack frame.
+  55:				SPTHREAD_RESTORE .macro
+  56:						exx
+  57:						ld	sp,hl		; resume from the thread location saved in hl'
+  58:						ex	de,hl
+  59:						exx
+  60:				.endm
+  61:				
+  62:				; The prologue for a subroutine that contains threaded code.
+  63:				SPTHREAD_ENTER .macro
+  64:						SPTHREAD_SAVE
+  65:						SPTHREAD_BEGIN
+  66:				.endm
+  67:				
+  68:				; The epilogue for a subroutine that contains threaded code.  To be followed by RET
+  69:				SPTHREAD_LEAVE .macro
+  70:						SPTHREAD_END
+  71:						SPTHREAD_RESTORE
+  72:				.endm
+  73:				
+  74:				
+  75:				
+  76:				MAC_SPT_CON_GOTO .macro row,col
+  77:						dw spt_con_goto, VBASE+(row*VLINE)+col
+  78:				.endm
+  79:				
+  80:				MAC_SPT_CON_OFFSET .macro row,col
+  81:						dw VBASE+(row*VLINE)+col
+  82:				.endm
+**** trs80m12diagcpm.asm ****
+  23:				.include "inc/m2.inc"
+**** inc/m2.inc ****
+   1:				; TRS-80 Model II hardware includes
+   2:				; Copyright 2012 Eric Smith <eric@brouhaha.com>
+   3:				; 20-FEB-2012
+   4:				
+   5:				; This program is free software: you can redistribute it and/or modify
+   6:				; it under the terms of version 3 of the GNU General Public License as
+   7:				; published by the Free Software Foundation.
+   8:				;
+   9:				; This program is distributed in the hope that it will be useful, but
+  10:				; WITHOUT ANY WARRANTY; without even the implied warranty of
+  11:				; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  12:				; General Public License for more details.
+  13:				;
+  14:				; You should have received a copy of the GNU General Public License
+  15:				; along with this program.  If not, see <http://www.gnu.org/licenses/>.
+  16:				
+  17:				; -------------------------------------------------------
+  18:				; I/O registers on CPU card
+  19:				; -------------------------------------------------------
+  20:				
+  21:     -	00F0          	ctc_reg		equ	0f0h	; four channels at consecutive port numbers
+  22:				
+  23:     -	0001          	ctc_bit_reset	equ	1
+  24:     -	0000          	ctc_bit_control	equ	0
+  25:				
+  26:     -	0002          	ctc_reset	equ	002h	; (1 SHL ctc_bit_reset)
+  27:     -	0001          	ctc_control	equ	001h	; (1 SHL ctc_bit_control)
+  28:				
+  29:				
+  30:     -	00F4          	sio_data_reg	equ	0f4h	; two channels at consecutive port numbers
+  31:     -	00F6          	sio_ctl_reg	equ	0f6h	; two channels at consecutive port numbers
+  32:				
+  33:     -	0018          	sio_cmd_channel_reset	equ	018h
+  34:				
+  35:				
+  36:     -	00F8          	dma_reg		equ	0f8h
+  37:				
+  38:     -	00C3          	dma_cmd_reset	equ	0c3h
+  39:				
+  40:				
+  41:     -	00F9          	rom_en_reg	equ	0f9h
+  42:				
+  43:				; -------------------------------------------------------
+  44:				; I/O registers on display/keyboard card
+  45:				; -------------------------------------------------------
+  46:				
+  47:     -	00FC          	kbd_data_reg	equ	0fch	; read only
+  48:     -	00FC          	crtc_addr_reg	equ	0fch	; write only
+  49:     -	00FD          	crtc_data_reg	equ	0fdh	; read/write
+  50:     -	00FE          	rtc_reg		equ	0feh	; clear RTC interrupt
+  51:				
+  52:				; CRTC cursor start register bits 
+  53:     -	0006          	crtc_cursor_bit_blink_enable	equ	6
+  54:     -	0005          	crtc_cursor_bit_blink_slow	equ	5
+  55:				
+  56:     -	0040          	crtc_cursor_blink_enable	equ	040h	; (1 SHL crtc_cursor_bit_blink_enable)
+  57:     -	0020          	crtc_cursor_blink_slow		equ	020h	; (1 SHL crtc_cursor_bit_blink_slow)
+  58:				
+  59:     -	00FF          	nmi_ram_reg	equ	0ffh	; write only
+  60:     -	0080          	nmi_ram_en_video_ram	equ	080h
+  61:     -	0040          	nmi_ram_dis_video	equ	040h
+  62:     -	0020          	nmi_ram_en_rtc_int	equ	020h
+  63:     -	0010          	nmi_ram_en_40_col	equ	010h
+  64:				; bank in bits 0-3
+  65:				
+  66:     -	00FF          	nmi_status_reg	equ	0ffh	; read only
+  67:     -	0007          	nmi_status_bit_kbd_int		equ	7
+  68:     -	0006          	nmi_status_bit_dis_video	equ	6
+  69:     -	0005          	nmi_status_bit_rtc_int_en	equ	5
+  70:     -	0004          	nmi_status_bit_40_col		equ	4
+  71:				; bits 3-0 are undefined - can't read back the RAM bank!
+  72:				
+  73:				; -------------------------------------------------------
+  74:				; I/O registers on floppy/printer card
+  75:				; -------------------------------------------------------
+  76:				
+  77:     -	00E0          	fdc_pio_reg		equ	0e0h
+  78:				
+  79:     -	00E4          	fdc_cmd_reg	equ	0e4h	; command register, write only
+  80:     -	0000          	fdc_cmd_restore		equ	000h
+  81:     -	0010          	fdc_cmd_seek		equ	010h
+  82:     -	0020          	fdc_cmd_step		equ	020h
+  83:     -	0040          	fdc_cmd_step_in		equ	040h
+  84:     -	0060          	fdc_cmd_step_out	equ	060h
+  85:     -	0080          	fdc_cmd_read_sector	equ	080h
+  86:     -	00A0          	fdc_cmd_write_sector	equ	0a0h
+  87:     -	00C0          	fdc_cmd_read_address	equ	0c0h
+  88:     -	00E0          	fdc_cmd_read_track	equ	0e0h
+  89:     -	00F0          	fdc_cmd_write_track	equ	0f0h
+  90:     -	00D0          	fdc_cmd_force_int	equ	0d0h
+  91:				
+  92:				; additional flags OR'd into restore/seek/step commands
+  93:     -	0010          	fdc_cmd_update_track	equ	010h	       ; step commands only
+  94:     -	0008          	fdc_cmd_head_load	equ	008h
+  95:     -	0004          	fdc_cmd_verify_track	equ	004h
+  96:     -	0000          	fdc_cmd_step_rate_3ms	equ	000h
+  97:     -	0001          	fdc_cmd_step_rate_6ms	equ	001h
+  98:     -	0002          	fdc_cmd_step_rate_10ms	equ	002h
+  99:     -	0003          	fdc_cmd_step_rate_15ms	equ	003h
+ 100:				
+ 101:				; interrupt reason selection for force_int command
+ 102:     -	0008          	fdc_cmd_force_int_immediate	equ	008h
+ 103:     -	0004          	fdc_cmd_force_int_index		equ	004h
+ 104:     -	0002          	fdc_cmd_force_int_not_ready	equ	002h
+ 105:     -	0001          	fdc_cmd_force_int_ready		equ	001h
+ 106:				
+ 107:				
+ 108:     -	00E4          	fdc_status_reg	equ	0e4h	; status register, read only
+ 109:				
+ 110:				; FDC status bits for all commands:
+ 111:     -	0000          	fdc_status_bit_busy		equ	0
+ 112:     -	0003          	fdc_status_bit_crc_err		equ	3
+ 113:     -	0006          	fdc_status_bit_write_protected	equ	6
+ 114:     -	0007          	fdc_status_bit_not_ready	equ	7
+ 115:				
+ 116:     -	0001          	fdc_status_busy			equ	001h
+ 117:     -	0008          	fdc_status_crc_err		equ	008h
+ 118:     -	0040          	fdc_status_write_protected	equ	040h
+ 119:     -	0080          	fdc_status_not_ready		equ	080h
+ 120:				
+ 121:				; FDC status bits for restore/seek/step commands:
+ 122:     -	0001          	fdc_status_bit_index		equ	1
+ 123:     -	0002          	fdc_status_bit_track_zero	equ	2
+ 124:     -	0004          	fdc_status_bit_seek_err		equ	4
+ 125:     -	0005          	fdc_status_bit_head_loaded	equ	5
+ 126:				
+ 127:     -	0002          	fdc_status_index		equ	002h
+ 128:     -	0004          	fdc_status_track_zero		equ	004h
+ 129:     -	0010          	fdc_status_seek_err		equ	010h
+ 130:     -	0020          	fdc_status_head_loaded		equ	020h
+ 131:				
+ 132:				; FDC status bits for read/write commands:
+ 133:     -	0001          	fdc_status_bit_drq    		equ	1
+ 134:     -	0002          	fdc_status_bit_lost_data	equ	2
+ 135:     -	0004          	fdc_status_bit_rec_not_found	equ	4
+ 136:     -	0005          	fdc_status_bit_deleted_data	equ	5	; read sector only
+ 137:     -	0005          	fdc_status_bit_write_fault	equ	5	; write sector/track only
+ 138:				
+ 139:     -	0002          	fdc_status_drq			equ	002h
+ 140:     -	0004          	fdc_status_lost_data		equ	004h
+ 141:     -	0010          	fdc_status_rec_not_found	equ	010h
+ 142:     -	0020          	fdc_status_deleted_data		equ	020h	; read sector only
+ 143:     -	0020          	fdc_status_write_fault		equ	020h	; write sector/track only
+ 144:				
+ 145:     -	00E5          	fdc_track_reg	equ	0e5h
+ 146:     -	00E6          	fdc_sector_reg	equ	0e6h
+ 147:     -	00E7          	fdc_data_reg	equ	0e7h
+ 148:     -	00E8          	fdc_reset_reg	equ	0e8h	; write only, late board revisions
+ 149:				
+ 150:     -	00EF          	fdc_select_reg	equ	0efh	; write only
+ 151:				
+ 152:				; bit masks in select register
+ 153:				; 3-0 select drive, active low - MUST set at least three of these high
+ 154:				
+ 155:     -	0080          	fdc_sel_mfm	equ	080h
+ 156:     -	0040          	fdc_sel_side_0	equ	040h
+ 157:     -	000F          	fdc_sel_dr_none	equ	00fh
+ 158:     -	000E          	fdc_sel_dr_0	equ	00eh
+ 159:     -	000D          	fdc_sel_dr_1	equ	00dh
+ 160:     -	000B          	fdc_sel_dr_2	equ	00bh
+ 161:     -	0007          	fdc_sel_dr_3	equ	007h
+ 162:				
+ 163:				; -------------------------------------------------------
+ 164:				; I/O registers on hard disk adapter and controller cards
+ 165:				; -------------------------------------------------------
+ 166:				
+ 167:				; For the 8MB drive, the write protect register, control register,
+ 168:				; and drive ID registers are on the adapter.  For other external
+ 169:				; drives, a different host adapter is necessary, and the write protect
+ 170:				; register, and control register are on the controller.
+ 171:     -	00C0          	hdc_write_protect_reg	equ	0c0h	; read only
+ 172:     -	00C1          	hdc_control_reg		equ	0c1h
+ 173:     -	00C2          	hdc_drive_id_45		equ	0c2h	; DIP switches, low nib 4, high nib 5
+ 174:     -	00C3          	hdc_drive_id_67		equ	0c3h	; DIP switches, low nib 6, high nib 7
+ 175:				
+ 176:     -	00C8          	hdc_data_reg		equ	0c8h
+ 177:     -	00C9          	hdc_error_reg		equ	0c9h	; read only
+ 178:     -	00C9          	hdc_write_precomp_reg	equ	0c9h	; write only
+ 179:     -	00CA          	hdc_sector_count_reg	equ	0cah
+ 180:     -	00CB          	hdc_sector_number_reg	equ	0cbh
+ 181:     -	00CC          	hdc_cylinder_low_reg	equ	0cch
+ 182:     -	00CD          	hdc_cylinder_high_reg	equ	0cdh
+ 183:     -	00CE          	hdc_size_drive_head_reg	equ	0ceh
+ 184:     -	00CF          	hdc_command_reg		equ	0cfh	; write only
+ 185:     -	00CF          	hdc_status_reg		equ	0cfh	; read only
+ 186:				
+ 187:				; hdc_write_protect_reg
+ 188:				; An extra chip select on pin 46 of the host interface is used to
+ 189:				; select this register for reading. This is not present on normal
+ 190:				; WD100x controllers.  See section C11-C12 of schematic in
+ 191:				; 8MB drive service manual.  Pin 5 of the ST506 interface radial
+ 192:				; data connectors is used for the active-low write protect signal.
+ 193:				; Note that the schematic of the 5MB controller shows the bits of the
+ 194:				; write protect register in the reverse order of those of the 8MB
+ 195:				; controller; possibly an error in the schematic? Unconfirmed.
+ 196:     -	0007          	hdc_write_protect_bit_intrq	equ	7	; interrupt request
+ 197:     -	0006          	hdc_write_protect_bit_hdwpl	equ	6	; write protect error, latched
+ 198:				; bits 5-4 are unused
+ 199:				; bits 3-0 are hardware write protect bits from the individual drives
+ 200:				
+ 201:				; hdc_control_reg
+ 202:				; bits 7, 5 unused
+ 203:     -	0040          	hdc_control_soft_int		equ	040h
+ 204:     -	0010          	hdc_control_soft_reset		equ	010h
+ 205:     -	0008          	hdc_control_deven		equ	008h
+ 206:     -	0004          	hdc_control_wait_enable		equ	004h
+ 207:     -	0002          	hdc_control_intrq_enable	equ	002h
+ 208:     -	0001          	hdc_control_dma_enable		equ	001h
+ 209:				
+ 210:				; hdc_error_reg:
+ 211:     -	0007          	hdc_error_bit_bad_block			equ	7
+ 212:     -	0006          	hdc_error_bit_crc_data			equ	6
+ 213:     -	0005          	hdc_error_bit_crc_id			equ	5
+ 214:     -	0004          	hdc_error_bit_id_not_found		equ	4
+ 215:     -	0002          	hdc_error_bit_aborted_cmd		equ	2
+ 216:     -	0001          	hdc_error_bit_track_0_not_found		equ	1
+ 217:     -	0000          	hdc_error_bit_data_mark_not_found	equ	0
+ 218:				
+ 219:				; hdc_size_drive_head_reg:
+ 220:     -	0000          	hdc_sdh_sect_size_256	equ	000h
+ 221:     -	0020          	hdc_sdh_sect_size_512	equ	020h
+ 222:     -	0060          	hdc_sdh_sect_size_128	equ	060h
+ 223:				
+ 224:				; hdc_command_reg:
+ 225:     -	0010          	hdc_command_restore		equ	010h	; logical OR with step rate
+ 226:     -	0070          	hdc_command_seek		equ	070h	; logical OR with step rate
+ 227:     -	0020          	hdc_command_read_sector_pio	equ	020h
+ 228:     -	0028          	hdc_command_read_sector_dma	equ	028h
+ 229:     -	0030          	hdc_command_write_sector	equ	030h
+ 230:     -	0050          	hdc_command_format_track	equ	050h
+ 231:				
+ 232:     -	0003          	hdc_command_step_rate_1p5_ms	equ	003h
+ 233:     -	000F          	hdc_command_step_rate_7p5_ms	equ	00fh
+ 234:				
+ 235:				; hdc_status_reg:
+ 236:     -	0007          	hdc_status_bit_busy			equ	7
+ 237:     -	0006          	hdc_status_bit_ready			equ	6
+ 238:     -	0005          	hdc_status_bit_write_fault		equ	5
+ 239:     -	0004          	hdc_status_bit_seek_complete		equ	4
+ 240:     -	0003          	hdc_status_bit_data_request		equ	3
+ 241:     -	0001          	hdc_status_bit_command_in_progress	equ	1	; WD1010, WD2010 only
+ 242:     -	0000          	hdc_status_bit_error			equ	0
+ 243:				
+ 244:				
+ 245:				; -------------------------------------------------------
+ 246:				; keycodes
+ 247:				; -------------------------------------------------------
+ 248:				
+ 249:     -	0003          	key_break	equ	003h
+ 250:     -	001B          	key_escape	equ	01bh
+ 251:				
+ 252:				; -------------------------------------------------------
+ 253:				; display
+ 254:				; -------------------------------------------------------
+ 255:				
+ 256:     -	0080          	inverse		equ	080h
+ 257:				
+ 258:				; -------------------------------------------------------
+ 259:				; memory map
+ 260:				; -------------------------------------------------------
+ 261:				
+ 262:     -	0000          	rom_start	equ	00000h
+ 263:     -	1000          	max_rom_size	equ	01000h		; ROM is only 2K, but 4K is reserved
+ 264:				
+ 265:     -	0000          	ram_start	equ	00000h
+ 266:     -	8000          	ram_size	equ	08000h		; assume 32K RAM, could be 64K
+ 267:				
+ 268:     -	F800          	screen_start	equ	0f800h
+ 269:     -	0800          	screen_size	equ	00800h
+ 270:				
+ 271:     -	0E00          	fd_load_addr	equ	00e00h		; first 512 bytes overlaid by ROM space
+ 272:     -	0080          	fd_load_sector_size	equ	128	; sector size of boot track
+ 273:     -	001A          	fd_load_sector_count	equ	26	; one full track
+ 274:     -	0028          	fd_retry_count		equ	40
+ 275:				
+ 276:				
+ 277:     -	0000          	hd_load_addr	equ	00000h		; first overlaid by ROM space
+ 278:							; we MUST load at least 9 sectors, because we can't
+ 279:							; detect the end signature below 1000 since the
+ 280:							; RAM from 0000-0fff is overlaid by this boot ROM
+ 281:				
+ 282:     -	2000          	fd_stack_init	equ	02000h
+ 283:     -	2800          	hd_stack_init	equ	02800h		; needs to be higher since HD
+ 284:									; bootstrap can be larger
+ 285:				
+**** trs80m12diagcpm.asm ****
+  24:				
+  25:				; Notes on global register allocation:
+  26:				;
+  27:				; This ROM doesn't work like typical Z80 code, which assumes the presence of a stack.
+  28:				; There may in fact be no working memory in the machine for holding the stack.
+  29:				;
+  30:				; An overall goal for this version of the code is to run in the absence of any working
+  31:				; ram at all.  There is no stack and no RAM variables.  The only storage of variables
+  32:				; is in registers, so the registers must be carefully preserved.
+  33:				;
+  34:				; Without a stack, that means either saving them to other registers and restoring before 
+  35:				; jumping to other code (remembering there can be no CALLs when there is no stack) 
+  36:				; or avoiding their use altogether.  These are extremely confining restrictions.
+  37:				;
+  38:				; Assembly purists will shudder at the extensive use of macros, but for sanity it
+  39:				; cannot be avoided.
+  40:				;
+  41:				; Globally, the contents of these registers must be preserved 
+  42:				;       e = bit errors in the region of memory currently being tested
+  43:				;       ix = current location in VRAM for printing messages
+  44:				;       iy = current table entry for test parameters
+  45:				;
+  46:				
+  47:				
+  48:				
+  49:     -	F000          	                .org  0f000h                            ; z80 boot code starts at location 0
+  50:     -	F000          	start:
+  51:    0+4	F000  F3      	                di                                      ; mask INT
+  52:    4+8	F001  ED56    	                im      1
+  53:   12+7	F003  3E01    	                ld      a,1
+  54:   19+11	F005  D3A8    	                out     (0a8h),a
+  55:				
+  56:     -	F007          	init_crtc:
+  57:   30+10	F007  01FC0F  	                ld      bc,$0FFC                        ; count $0F, port $FC crtc address reg
+  58:   40+10	F00A  2192F7  	                ld      hl,crtc_setup_table+crtc_setup_len-1
+  59:   50+7	F00D  7E      	        .loop:  ld      a,(hl)                          ; fetch bytes from setup table and send top to bottom
+  60:   57+12	F00E  ED41    	                out     (c),b                           ; CRTC address register
+  61:   69+11	F010  D3FD    	                out     ($FD),a                         ; CRTC data register
+  62:   80+6	F012  2B      	                dec     hl
+  63:   86+4	F013  05      	                dec     b
+  64:   90+10	F014  F20DF0  	                jp      p,.loop
+  65:				
+  66:				
+  67:     -	F017          	test_vram:
+  68:     -	F017          	                SPTHREAD_BEGIN                          ; set up to begin running threaded code
+  68:  100+10	F017  311BF0  			ld	sp,.?a0000
+  68:  110+10	F01A  C9      			ret
+  68:     -	F01B          		.?a0000:
+  68:     -	F01B          	.endm
+  69:     -	F01B  7EF7    	                dw vram_map                             ; map in VRAM so we can print results
+  70:				
+  71:				                ;;;; test the VRAM while lighting/clicking the floppy drive
+  72:     -	F01D  1AF7A7F1	                dw spt_call, sptc_fdc_reset_head
+  73:     -	F021  07F780F3	                dw spt_select_test, tp_vram
+  74:     -	F025  6CF4    	                dw memtestmarch                         ; test the VRAM
+  75:     -	F027  81F1    	                dw fdc_select_none
+  76:     -	F029  12F737F0	                dw spt_jp_nc, .vram_ok
+  77:				
+  78:				                ;;;; the VRAM tests bad.  Report and loop
+  79:     -	F02D  DEF2    	                dw chartest_fullscreen
+  80:     -	F02F          	        .vram_bad:
+  81:     -	F02F  1AF7ADF2	                dw spt_call, sptc_blink_biterrs
+  82:     -	F033  0FF72FF0	                dw spt_jp, .vram_bad
+  83:				
+  84:				
+  85:     -	F037          	        .vram_ok:
+  86:				                ;;;; clear the screen, print charset at bottom, report the results of the VRAM test
+  87:     -	F037  68F7    	                dw con_clear
+  88:     -	F039  7AF70A00	                dw spt_con_index,10
+  89:     -	F03D  26F70EF3	                dw spt_con_print, msg_banner            ; print the banner
+  90:     -	F041  1AF7C7F2	                dw spt_call, sptc_print_charset
+  91:     -	F045  07F780F3	                dw spt_select_test, tp_vram
+  92:     -	F049  1AF709F2	                dw spt_call, sptc_announcetest          ; print results of VRAM tst
+  93:     -	F04D  26F74CF3	                dw spt_con_print, msg_testok
+  94:     -	F051  A4F7    	                dw con_clear_kbd
+  95:				
+  96:     -	F053          	        .test_4000:
+  97:				                ;;;; Test DRAM.  Start by testint the bank to which we are going to relocate some code
+  98:     -	F053  07F78CF3	                dw spt_select_test, tp_rdest            ; load the test parameters
+  99:     -	F057  1AF709F2	                dw spt_call, sptc_announcetest          ; announce what test we are about to run
+ 100:     -	F05B  DFF1    	                dw tp_map_bank                          ; map in the bank to test (this unmaps VRAM)
+ 101:     -	F05D  1AF7CFF0	                dw spt_call, sptc_bank_test_and_report
+ 102:				;                dw spt_jp_nc, .test_0000
+ 103:				
+ 104:				                ;;;; The bank at $4000 is bad, so report this and skip the relocation test
+ 105:				;                dw spt_select_test, tp_low              ; announce that we're skipping the relocating test
+ 106:				;                dw spt_call, sptc_announcetest          ; 
+ 107:				;                dw spt_con_print, msg_skipped           ; we can't run the low test
+ 108:				;                dw spt_jp, .test_banked
+ 109:				
+ 110:     -	F061          	        .test_0000:
+ 111:				                ;;;; The bank at $4000 is ok, so run the relocation test
+ 112:				                ;;;; relocate the memory test into upper half of low RAM, unmap ROM, run test on lowest RAM
+ 113:				;                dw relocate_memtest
+ 114:     -	F061  07F766F4	                dw spt_select_test, tp_low_reloc        ; select the low mem test next
+ 115:     -	F065  1AF709F2	                dw spt_call, sptc_announcetest
+ 116:     -	F069  1AF755F4	                dw spt_call, sptc_relocated_test
+ 117:     -	F06D  1AF7D1F0	                dw spt_call, sptc_bank_report
+ 118:				
+ 119:     -	F071          	        .test_banked:   
+ 120:				                ;;;; Start loopin through the rest of the banks, testing each one
+ 121:     -	F071  07F792F3	                dw spt_select_test, tp_high             ; load the test table
+ 122:				
+ 123:     -	F075          	        .bank_loop:
+ 124:				                ;;;; top of the loop for each bank
+ 125:     -	F075  9FF0    	                dw check_boot_keys
+ 126:				                ;;;; check to see if auto-booting has been cancelled errors or ESC
+ 127:				                ; dw spt_jp_boot_cancelled,.bank_test     ; don't try to boot if there are errors
+ 128:				                ; dw spt_jp_fdc_ready,spt_boot_fd         ; boot from the floppy if it is ready
+ 129:				
+ 130:     -	F077          	        .bank_test:
+ 131:				                ;;;; run one bank test
+ 132:     -	F077  1AF709F2	                dw spt_call, sptc_announcetest          ; announce what test we are about to run
+ 133:     -	F07B  DFF1    	                dw tp_map_bank
+ 134:     -	F07D  E5F08DF0	                dw spt_jp_bank_dup, .bank_dup
+ 135:     -	F081  1AF7CFF0	                dw spt_call, sptc_bank_test_and_report
+ 136:				
+ 137:     -	F085          	        .bank_cont:                                             
+ 138:				                ;;;; Finished testing this bank.  Determine what to do next.
+ 139:     -	F085  F0F19BF0	                dw spt_tp_next, .table_done             ; start over if we've reached the end
+ 140:				                ; dw spt_jp_fdc_ready,spt_boot_fd       ; boot from the floppy if it is ready
+ 141:     -	F089  0FF775F0	                dw spt_jp, .bank_loop                   ; else test the next bank
+ 142:				
+ 143:     -	F08D          	        .bank_dup:
+ 144:				                ;;;; we've detected a duplicate bank (bank mapped in more than one place)
+ 145:     -	F08D  7EF7    	                dw vram_map                             ; in this case, VRAM was not remapped, do it now
+ 146:     -	F08F  26F770F3	                dw spt_con_print, msg_dup
+ 147:     -	F093  1AF72DF1	                dw spt_call, sptc_printbank
+ 148:     -	F097  0FF785F0	                dw spt_jp, .bank_cont
+ 149:				
+ 150:     -	F09B          	        .table_done:
+ 151:				                ;;;; reached the end of the table
+ 152:				;                dw spt_jp_boot_cancelled,.test_4000             ; don't try to boot if there are errors
+ 153:				;                dw spt_jp_hd_present,spt_boot_hd        ; boot from the HD if it's present
+ 154:     -	F09B  0FF753F0	                dw spt_jp, .test_4000
+ 155:				
+ 156:				;; -------------------------------------------------------------------------------------------------
+ 157:				;; end of main program.
+ 158:				
+ 159:     -	F09F          	check_boot_keys:
+ 160:  120+11	F09F  DBFF    	                in      a,(nmi_status_reg)              ; see if there is a key available
+ 161:  131+8	F0A1  CB7F    	                bit     nmi_status_bit_kbd_int,a
+ 162:  139+5+6	F0A3  C8      	                ret     z                               ; just return if no key pressed
+ 163:  144+11	F0A4  DBFC    	                in      a,(kbd_data_reg)
+ 164:  155+7	F0A6  FE1B    	                cp      $1B                             ; press ESC for floppy
+ 165:  162+10	F0A8  CACAF5  	                jp      z,boot_fd0
+ 166:  172+7	F0AB  FE03    	                cp      $03                             ; press BREAK for floppy
+ 167:  179+10	F0AD  CACAF5  	                jp      z,boot_fd0
+ 168:  189+7	F0B0  FE31    	                cp      '1'                             ; press 1 for hard disk
+ 169:  196+10	F0B2  CA2AF5  	                jp      z,boot_hd0
+ 170:  206+7	F0B5  FE20    	                cp      ' '                             ; space to cancel booting and loop tests
+ 171:  213+5+6	F0B7  C0      	                ret     nz                              ; just continue if no match
+ 172:  218+13	F0B8  3A00F8  	                ld      a,(VBASE)
+ 173:  231+7	F0BB  FE20    	                cp      ' '
+ 174:  238+7+5	F0BD  2806    	                jr      z,.cancel
+ 175:  245+7	F0BF  3E20    	                ld      a,' '
+ 176:  252+13	F0C1  3200F8  	                ld      (VBASE),a
+ 177:  265+10	F0C4  C9      	                ret
+ 178:     -	F0C5          	        .cancel:
+ 179:  275+7	F0C5  3E21    	                ld      a,'!'                           ; mark to skip booting
+ 180:  282+13	F0C7  3200F8  	                ld      (VBASE),a
+ 181:  295+10	F0CA  C9      	                ret
+ 182:				
+ 183:				
+ 184:     -	F0CB          	spt_boot_hd:
+ 185:				                ; dw spt_call,spt_print_boot_msg
+ 186:				                ; ; MAC_SPT_CON_GOTO 1,35
+ 187:				                ; ; dw spt_con_print, msg_boot
+ 188:				                ; dw spt_con_print, msg_hd
+ 189:     -	F0CB  2AF5    	                dw boot_hd0
+ 190:     -	F0CD          	spt_boot_fd:
+ 191:				                ; dw spt_call,spt_print_boot_msg
+ 192:				                ; ; MAC_SPT_CON_GOTO 1,35
+ 193:				                ; ; dw spt_con_print, msg_boot
+ 194:				                ; dw spt_con_print, msg_fd
+ 195:     -	F0CD  CAF5    	                dw boot_fd0
+ 196:				
+ 197:				
+ 198:     -	F0CF          	sptc_bank_test_and_report:
+ 199:     -	F0CF  6CF4    	                dw memtestmarch                         ; test the current bank
+ 200:     -	F0D1          	sptc_bank_report:
+ 201:     -	F0D1  0EF1    	                dw mark_bank_map_vram
+ 202:     -	F0D3  12F7DFF0	                dw spt_jp_nc, .bank_ok
+ 203:				
+ 204:     -	F0D7  1AF75AF2	                dw spt_call, sptc_print_errsmsg
+ 205:     -	F0DB  6AF2    	                dw print_biterrs
+ 206:     -	F0DD  0AF7    	                dw spt_exit
+ 207:				
+ 208:     -	F0DF          	        .bank_ok:       
+ 209:     -	F0DF  26F74CF3	                dw spt_con_print, msg_testok
+ 210:     -	F0E3  0AF7    	                dw spt_exit
+ 211:				
+ 212:				
+ 213:     -	F0E5          	spt_jp_bank_dup:
+ 214:				                ; determine if this bank is a different, already tested bank
+ 215:  305+4	F0E5  08      	                ex      af,af'                          ; save old flags
+ 216:  309+19	F0E6  FD6601  	                ld      h,(iy+TP_BASE)                  ; get the base address of ram
+ 217:  328+7	F0E9  2E0F    	                ld      l,15                            ; plus 15 bytes
+ 218:  335+10	F0EB  010F00  	                ld      bc,15                           ; compare bytes at offset 15...1 (not 0)
+ 219:  345+7	F0EE  3E55    	                ld      a,$55                           ; test that the bank is filled with $55
+ 220:     -	F0F0          	        .test55:
+ 221:  352+16	F0F0  EDA9    	                cpd                                     ; compare a,(hl) ; hl-- ; bc--
+ 222:  368+7+5	F0F2  2009    	                jr      nz,.done                        ; if mem != $55, this isn't a tested bank, so quit
+ 223:  375+10	F0F4  EAF0F0  	                jp      pe,.test55                      ; if we have more to test, loop
+ 224:				        
+ 225:  385+7	F0F7  7E      	                ld      a,(hl)                          ; HL should now be the base address
+ 226:  392+19	F0F8  FDBE02  	                cp      (iy+TP_BANK)                    ; compare to current bank number
+ 227:  411+7+5	F0FB  3803    	                jr      c,.dup                          ; mem < bank; found a duplicate bank number
+ 228:     -	F0FD          	        .done:
+ 229:  418+10	F0FD  E1      	                pop     hl                              ; discard the error address
+ 230:  428+4	F0FE  08      	                ex      af,af'
+ 231:  432+10	F0FF  C9      	                ret
+ 232:				        
+ 233:     -	F100          	        .dup:                                           ; found a match.  Jump to the specified SPT location
+ 234:  442+4	F100  5F      	                ld      e,a                             ; report the error as the bank we found
+ 235:  446+4	F101  08      	                ex      af,af'
+ 236:  450+10	F102  E1      	                pop     hl
+ 237:  460+6	F103  F9      	                ld      sp,hl
+ 238:  466+10	F104  C9      	                ret
+ 239:				
+ 240:     -	F105          	spt_jp_boot_cancelled:
+ 241:  476+10	F105  E1      	                pop     hl                              ; get the address to jump to if there are errors
+ 242:  486+13	F106  3A00F8  	                ld      a,(VBASE)
+ 243:  499+7	F109  FE20    	                cp      ' '                             ; if there is no exclamation point
+ 244:  506+5+6	F10B  C8      	                ret     z                               ; continue
+ 245:  511+6	F10C  F9      	                ld      sp,hl                           ; else go to new thread location
+ 246:  517+10	F10D  C9      	                ret
+ 247:				
+ 248:     -	F10E          	mark_bank_map_vram:
+ 249:  527+4	F10E  08      	                ex      af,af'                          ; save flags
+ 250:  531+19	F10F  FD6601  	                ld      h,(iy+TP_BASE)                  ; get this bank's base in HL
+ 251:  550+7	F112  2E00    	                ld      l,0
+ 252:  557+19	F114  FD4602  	                ld      b,(iy+TP_BANK)                  ; get the bank number in b
+ 253:  576+7	F117  70      	                ld      (hl),b                          ; mark the base address with the bank number
+ 254:				
+ 255:  583+4	F118  78      	                ld      a,b                             ; get the bank number into A
+ 256:  587+7	F119  F680    	                or      $80                             ; enable VRAM
+ 257:  594+11	F11B  D3FF    	                out     ($FF),a                         ; map in VRAM and the current bank
+ 258:				
+ 259:  605+4	F11D  08      	                ex      af,af'                          ; restore the saved flags
+ 260:  609+5+6	F11E  D0      	                ret     nc                              ; return if the test had no error
+ 261:				                ; ex    af,af'                          ; save flags
+ 262:				
+ 263:  614+7	F11F  3EFF    	                ld      a,$ff                           ; see if this is a an absent bank
+ 264:  621+4	F121  BB      	                cp      e
+ 265:  625+7+5	F122  2805    	                jr      z,.absent                       ; if absent, don't record it as an errored bank
+ 266:				
+ 267:  632+7	F124  3E21    	                ld      a,'!'                           ; not absent, but bad; note this with the exclamation
+ 268:  639+13	F126  3200F8  	                ld      (VBASE),a                       ; put an exclamation in the corner if this bank is bad
+ 269:     -	F129          	        .absent:
+ 270:				                ; ex    af,af'                          ; restore the saved flags
+ 271:  652+4	F129  37      	                scf                                     ; set the carry flag again
+ 272:  656+10	F12A  C9      	                ret
+ 273:				
+ 274:     -	F12B          	ld_a_e:
+ 275:  666+4	F12B  7B      	                ld      a,e
+ 276:  670+10	F12C  C9      	                ret
+ 277:				
+ 278:     -	F12D          	sptc_printbank:
+ 279:     -	F12D  2BF1    	                dw ld_a_e
+ 280:     -	F12F  46F7    	                dw con_printh
+ 281:     -	F131  26F70CF3	                dw spt_con_print,msg_space
+ 282:     -	F135  0AF7    	                dw spt_exit
+ 283:				
+ 284:     -	F137          	ld_d_0:
+ 285:  680+7	F137  1600    	                ld      d,0
+ 286:  687+10	F139  C9      	                ret
+ 287:				
+ 288:     -	F13A          	spt_dec_d_jp_nz:
+ 289:  697+10	F13A  E1      	                pop     hl
+ 290:  707+4	F13B  15      	                dec     d
+ 291:  711+5+6	F13C  C8      	                ret     z
+ 292:  716+6	F13D  F9      	                ld      sp,hl
+ 293:  722+10	F13E  C9      	                ret
+ 294:				
+ 295:     -	F13F          	spt_jp_fdc_ready:
+ 296:  732+10	F13F  E1      	                pop     hl
+ 297:  742+7	F140  3E4E    	                ld      a,fdc_sel_side_0+fdc_sel_dr_0
+ 298:  749+11	F142  D3EF    	                out     (fdc_select_reg),a
+ 299:  760+11	F144  DBE4    	                in      a,(fdc_status_reg)
+ 300:  771+8	F146  CB7F    	                bit     7,a
+ 301:  779+5+6	F148  C0      	                ret     nz                              ; return if not ready
+ 302:  784+6	F149  F9      	                ld      sp,hl
+ 303:  790+10	F14A  C9      	                ret
+ 304:				
+ 305:     -	F14B          	spt_jp_hd_present:
+ 306:				                ; reset HDC and check for drive presence
+ 307:  800+4	F14B  AF      	                xor     a
+ 308:  804+11	F14C  D3C1    	                out     (hdc_control_reg),a
+ 309:  815+7	F14E  3E10    	                ld      a,hdc_control_soft_reset
+ 310:  822+11	F150  D3C1    	                out     (hdc_control_reg),a
+ 311:				
+ 312:				                ; Earlier versions of the boot ROM didn't enable interrupt and DMA.  Not sure
+ 313:				                ; why this is a good idea.
+ 314:  833+7	F152  3E0F    	                ld      a,hdc_control_deven+hdc_control_wait_enable+hdc_control_intrq_enable+hdc_control_dma_enable
+ 315:  840+11	F154  D3C1    	                out     (hdc_control_reg),a
+ 316:				
+ 317:  851+11	F156  DBC2    	                in      a,(hdc_drive_id_45)             ; check ID of drive 4
+ 318:  862+7	F158  E60F    	                and     $0f
+ 319:				
+ 320:  869+10	F15A  E1      	                pop     hl
+ 321:  879+5+6	F15B  C8      	                ret     z                               ; return if not present
+ 322:  884+6	F15C  F9      	                ld      sp,hl
+ 323:  890+10	F15D  C9      	                ret
+ 324:				
+ 325:				
+ 326:     -	F15E          	sptc_fdc_terminate_ready_timeout:
+ 327:     -	F15E  37F1    	                dw      ld_d_0                          ; wait up to 256 times, then fail out
+ 328:     -	F160  70F1    	        .loop:  dw      fdc_terminate_cmd
+ 329:     -	F162  3FF16EF1	                dw      spt_jp_fdc_ready,.done
+ 330:     -	F166  4DF20005	                dw      spt_pause,$0500
+ 331:     -	F16A  3AF160F1	                dw      spt_dec_d_jp_nz,.loop
+ 332:     -	F16E  0AF7    	        .done:  dw      spt_exit
+ 333:				
+ 334:				; terminate_fdc_cmd:
+ 335:     -	F170          	fdc_terminate_cmd:
+ 336:  900+7	F170  3ED8    	        .start: ld      a,fdc_cmd_force_int+fdc_cmd_force_int_immediate
+ 337:  907+11	F172  D3E4    	                out     (fdc_cmd_reg),a
+ 338:  918+7	F174  3ED0    	                ld      a,fdc_cmd_force_int
+ 339:  925+11	F176  D3E4    	                out     (fdc_cmd_reg),a
+ 340:				
+ 341:  936+7	F178  060B    	                ld      b,11
+ 342:  943+8+5	F17A  10FE    	        .delay: djnz    .delay                          ; delay by 138 T-states (34.5ms@4MHz)
+ 343:				
+ 344:  951+11	F17C  DBE7    	                in      a,(fdc_data_reg)                ; to reset DRQ, presumably
+ 345:  962+11	F17E  DBE4    	                in      a,(fdc_status_reg)
+ 346:  973+10	F180  C9      	                ret
+ 347:				
+ 348:     -	F181          	fdc_select_none:
+ 349:  983+7	F181  3E4F    	                ld      a,fdc_sel_side_0|fdc_sel_dr_none
+ 350:  990+12	F183  1802    	                jr      fdc_select
+ 351:     -	F185          	fdc_select_d0s0:
+ 352: 1002+7	F185  3E4E    	                ld      a,fdc_sel_side_0|fdc_sel_dr_0   ; select d0s0
+ 353:     -	F187          	fdc_select:
+ 354: 1009+11	F187  D3EF    	                out     (fdc_select_reg),a
+ 355: 1020+7	F189  0600    	                ld      b,0                             ; short delay for FDC to respond
+ 356: 1027+8+5	F18B  10FE    	        .dly1:  djnz    .dly1
+ 357: 1035+10	F18D  C9      	                ret
+ 358:				
+ 359:				; fdc_deselect:
+ 360:				;               ld      a,fdc_sel_dr_none               ; deselect the drive
+ 361:				;               out     (fdc_select_reg),a
+ 362:				;               ret
+ 363:				
+ 364:     -	F18E          	fdc_step_in_5:
+ 365: 1045+7	F18E  0E05    	                ld      c,5
+ 366:     -	F190          	fdc_step_in:
+ 367: 1052+7	F190  3E5B    	        .silp:  ld      a,fdc_cmd_step_in|fdc_cmd_update_track|fdc_cmd_head_load|fdc_cmd_step_rate_15ms
+ 368: 1059+11	F192  D3E4    	                out     (fdc_cmd_reg),a
+ 369:				
+ 370: 1070+7	F194  0600    	                ld      b,0                             ; short delay for FDC to respond
+ 371: 1077+8+5	F196  10FE    	        .dly1:  djnz    .dly1
+ 372:				
+ 373: 1085+11	F198  DBE4    	        .wrdy1: in      a,(fdc_status_reg)              ; wait for ready indication
+ 374: 1096+8	F19A  CB47    	                bit     0,a
+ 375:				                ; and   $81
+ 376: 1104+7+5	F19C  20FA    	                jr      nz,.wrdy1
+ 377:				        
+ 378: 1111+4	F19E  0D      	                dec     c
+ 379: 1115+7+5	F19F  20EF    	                jr      nz,.silp                ; repeate the stepping
+ 380: 1122+10	F1A1  C9      	                ret
+ 381:				
+ 382:     -	F1A2          	fdc_head_restore:
+ 383: 1132+7	F1A2  3E0B    	                ld      a,fdc_cmd_restore|fdc_cmd_head_load|fdc_cmd_step_rate_15ms
+ 384: 1139+11	F1A4  D3E4    	                out     (fdc_cmd_reg),a                 ; restore head to track zero
+ 385: 1150+10	F1A6  C9      	                ret
+ 386:				
+ 387:				
+ 388:     -	F1A7          	sptc_fdc_reset_head:
+ 389:     -	F1A7  85F1    	                dw fdc_select_d0s0
+ 390:				                ; dw fdc_terminate_cmd                  ; reset FDC
+ 391:     -	F1A9  1AF75EF1	                dw spt_call, sptc_fdc_terminate_ready_timeout
+ 392:     -	F1AD  8EF1    	                dw fdc_step_in_5
+ 393:     -	F1AF  A2F1    	                dw fdc_head_restore
+ 394:				                ; dw spt_pause,1599
+ 395:     -	F1B1  4DF2D007	                dw spt_pause,2000
+ 396:     -	F1B5  0AF7    	                dw spt_exit
+ 397:				
+ 398:				; fdc_head_unload:
+ 399:				;               ld      a,fdc_cmd_restore|fdc_cmd_head_load|fdc_cmd_step_rate_15ms
+ 400:				;               out     (fdc_cmd_reg),a                 ; restore head to track zero
+ 401:				;               ret
+ 402:				
+ 403:				; sptc_fdc_release_head:
+ 404:				;               dw
+ 405:				
+ 406:				
+ 407:				; test if the e register matches 7-bit vram and jump to spt address if match
+ 408:     -	F1B7          	spt_jp_e_zero:
+ 409: 1160+10	F1B7  E1      	                pop     hl                              ; get the address for jumping if match
+ 410: 1170+7	F1B8  3E00    	                ld      a,0                             ; test clean
+ 411: 1177+4	F1BA  BB      	                cp      e                               ; 
+ 412: 1181+5+6	F1BB  C0      	                ret     nz                              ; return without jump if there is NOT a match
+ 413: 1186+6	F1BC  F9      	                ld      sp,hl                           ; else jump to the requested location
+ 414: 1192+10	F1BD  C9      	                ret
+ 415:				
+ 416:     -	F1BE          	spt_jp_e_ff:
+ 417: 1202+10	F1BE  E1      	                pop     hl                              ; get the address for jumping if match
+ 418: 1212+7	F1BF  3EFF    	                ld      a,$FF                           ; test all bits err
+ 419: 1219+4	F1C1  BB      	                cp      e                               ; 
+ 420: 1223+5+6	F1C2  C0      	                ret     nz                              ; return without jump if there is NOT a match
+ 421: 1228+6	F1C3  F9      	                ld      sp,hl                           ; else jump to the requested location
+ 422: 1234+10	F1C4  C9      	                ret
+ 423:				
+ 424:				
+ 425:				
+ 426:				; load the label string address from the current test parameter table entry into hl
+ 427:     -	F1C5          	ld_hl_tp_label:
+ 428: 1244+19	F1C5  FD4E03  	                ld      c,(iy+TP_LABEL)
+ 429: 1263+7	F1C8  0600    	                ld      b,0
+ 430: 1270+10	F1CA  21ECF2  	                ld      hl,labels_start
+ 431: 1280+11	F1CD  09      	                add     hl,bc
+ 432: 1291+10	F1CE  C9      	                ret
+ 433:				
+ 434:     -	F1CF          	ld_hl_tp_base:
+ 435: 1301+19	F1CF  FD6601  	                ld      h,(iy+TP_BASE)
+ 436: 1320+7	F1D2  2E00    	                ld      l,0
+ 437: 1327+10	F1D4  C9      	                ret
+ 438:				
+ 439:     -	F1D5          	ld_bc_tp_size:
+ 440: 1337+19	F1D5  FD4600  	                ld      b,(iy+TP_SIZE)
+ 441: 1356+7	F1D8  0E00    	                ld      c,0
+ 442: 1363+10	F1DA  C9      	                ret
+ 443:				
+ 444:     -	F1DB          	ld_a_tp_bank:
+ 445: 1373+19	F1DB  FD7E02  	                ld      a,(iy+TP_BANK)
+ 446: 1392+10	F1DE  C9      	                ret
+ 447:				
+ 448:				
+ 449:     -	F1DF          	tp_map_bank:
+ 450: 1402+19	F1DF  FD7E02  	                ld      a,(iy+TP_BANK)
+ 451:				;                cp      0                               ; special case: when we say bank 0, we really mean 1
+ 452:				;                jr      nz,.send
+ 453:				;                ld      a,1                             ; substitute a 1 when actually banking 0
+ 454:     -	F1E2          	        .send:
+ 455: 1421+11	F1E2  D3FF    	                out     ($FF),a
+ 456: 1432+10	F1E4  C9      	                ret
+ 457:				
+ 458: 1442+19	F1E5  FD7E04  	spt_tp_goto:    ld      a,(iy+TP_POS)
+ 459: 1461+8	F1E8  DD6F    	                ld      ixl,a
+ 460: 1469+19	F1EA  FD7E05  	                ld      a,(iy+TP_POS+1)
+ 461: 1488+8	F1ED  DD67    	                ld      ixh,a
+ 462: 1496+10	F1EF  C9      	                ret
+ 463:				
+ 464:				; move to the next test parameter table entry
+ 465: 1506+10	F1F0  E1      	spt_tp_next:    pop     hl                              ; get the address to jump to if we are starting over
+ 466: 1516+10	F1F1  010600  	                ld      bc,tp_entrysize                 ; find the next entry
+ 467: 1526+15	F1F4  FD09    	                add     iy,bc
+ 468: 1541+19	F1F6  FD7E00  	                ld      a,(iy+TP_SIZE)                  ; is the length zero?
+ 469: 1560+4	F1F9  B7      	                or      a
+ 470: 1564+5+6	F1FA  C0      	                ret     nz                              ; no, use it
+ 471:				
+ 472: 1569+19	F1FB  FD4E01  	                ld      c,(iy+TP_GOTO)                  ; yes, get the address of the first entry
+ 473: 1588+19	F1FE  FD4602  	                ld      b,(iy+TP_GOTO+1)
+ 474: 1607+14	F201  FD210000	                ld      iy,0
+ 475: 1621+15	F205  FD09    	                add     iy,bc
+ 476: 1636+6	F207  F9      	                ld      sp,hl                           ; jump to the next location
+ 477: 1642+10	F208  C9      	                ret
+ 478:				
+ 479:     -	F209          	sptc_announcetest:
+ 480:     -	F209  E5F1    	                dw spt_tp_goto
+ 481:     -	F20B  C5F1    	                dw ld_hl_tp_label
+ 482:     -	F20D  27F7    	                dw con_print
+ 483:     -	F20F  DBF1    	                dw ld_a_tp_bank
+ 484:     -	F211  46F7    	                dw con_printh
+ 485:     -	F213  26F70CF3	                dw spt_con_print, msg_space
+ 486:     -	F217  1AF72DF2	                dw spt_call, sptc_tp_print_range
+ 487:     -	F21B  26F777F3	                dw spt_con_print, msg_testing
+ 488:     -	F21F  7AF7F8FF	                dw spt_con_index, -status_backup
+ 489:     -	F223  0AF7    	                dw spt_exit
+ 490:				
+ 491: 1652+4	F225  7C      	ld_a_h:         ld      a,h
+ 492: 1656+10	F226  C9      	                ret
+ 493:				
+ 494: 1666+4	F227  7D      	ld_a_l:         ld      a,l
+ 495: 1670+10	F228  C9      	                ret
+ 496:				
+ 497: 1680+11	F229  09      	add_hl_bc:      add     hl,bc
+ 498: 1691+10	F22A  C9      	                ret
+ 499:				
+ 500: 1701+6	F22B  2B      	dec_hl:         dec     hl
+ 501: 1707+10	F22C  C9      	                ret
+ 502:				
+ 503:     -	F22D          	sptc_tp_print_range:
+ 504:     -	F22D  CFF1    	                dw ld_hl_tp_base
+ 505:     -	F22F  25F2    	                dw ld_a_h
+ 506:     -	F231  34F7    	                dw con_printx
+ 507:     -	F233  27F2    	                dw ld_a_l
+ 508:     -	F235  34F7    	                dw con_printx
+ 509:     -	F237  26F70AF3	                dw spt_con_print, msg_dash
+ 510:				
+ 511:     -	F23B  CFF1    	                dw ld_hl_tp_base
+ 512:     -	F23D  D5F1    	                dw ld_bc_tp_size
+ 513:     -	F23F  29F2    	                dw add_hl_bc
+ 514:     -	F241  2BF2    	                dw dec_hl
+ 515:     -	F243  25F2    	                dw ld_a_h
+ 516:     -	F245  34F7    	                dw con_printx
+ 517:     -	F247  27F2    	                dw ld_a_l
+ 518:     -	F249  34F7    	                dw con_printx
+ 519:				                ; dw spt_con_print, msg_space
+ 520:     -	F24B  0AF7    	                dw spt_exit
+ 521:				
+ 522:				
+ 523:     -	F24D          	spt_pause:                                                      ; pause by an amount specified in BC
+ 524: 1717+10	F24D  C1      	                pop     bc
+ 525:     -	F24E          	pause_bc:                                                       ; pause by BC*50-5+14 t-states
+ 526: 1727+4	F24E  08      	                ex      af,af'
+ 527:     -	F24F          	        .loop:                                                  
+ 528:     -	F24F          	                nop12
+ 528: 1731+12	F24F  1800    			jr	$+2
+ 528:     -	F251          	.endm
+ 529:     -	F251          	                nop12
+ 529: 1743+12	F251  1800    			jr	$+2
+ 529:     -	F253          	.endm
+ 530: 1755+6	F253  0B      	                dec     bc
+ 531: 1761+4	F254  78      	                ld      a,b
+ 532: 1765+4	F255  B1      	                or      c
+ 533: 1769+7+5	F256  20F7    	                jr      nz,.loop
+ 534: 1776+4	F258  08      	                ex      af,af'
+ 535: 1780+10	F259  C9      	                ret
+ 536:				
+ 537:				
+ 538:     -	F25A          	sptc_print_errsmsg:
+ 539:     -	F25A  BEF164F2	                dw spt_jp_e_ff,.absent
+ 540:     -	F25E  26F75EF3	                dw spt_con_print,msg_biterrs
+ 541:     -	F262  0AF7    	                dw spt_exit
+ 542:     -	F264          	        .absent:
+ 543:     -	F264  26F767F3	                dw spt_con_print,msg_absent
+ 544:     -	F268  0AF7    	                dw spt_exit
+ 545:				
+ 546:     -	F26A          	print_biterrs:
+ 547: 1790+7	F26A  3E37    	                ld      a,'7'
+ 548: 1797+7	F26C  0608    	                ld      b,8
+ 549:     -	F26E          	        .showbit:
+ 550: 1804+8	F26E  CB03    	                rlc     e
+ 551: 1812+7+5	F270  3005    	                jr      nc,.zero
+ 552: 1819+19	F272  DD7700  	                ld      (ix+0),a
+ 553: 1838+12	F275  1804    	                jr      .cont
+ 554:     -	F277          	        .zero:
+ 555: 1850+19	F277  DD36002E	                ld      (ix+0),'.'
+ 556:     -	F27B          	        .cont:
+ 557: 1869+10	F27B  DD23    	                inc     ix
+ 558: 1879+4	F27D  3D      	                dec     a
+ 559: 1883+8+5	F27E  10EE    	                djnz    .showbit
+ 560:				
+ 561: 1891+10	F280  C9      	                ret
+ 562:				
+ 563:     -	F281          	rlc_e:
+ 564: 1901+8	F281  CB03    	                rlc     e
+ 565: 1909+10	F283  C9      	                ret
+ 566:				
+ 567:     -	F284          	spt_blink_bit_rl:
+ 568:				                ; rlc   e
+ 569:     -	F284          	                SPTHREAD_ENTER
+ 569:     -	F284          			SPTHREAD_SAVE
+ 569: 1919+4	F284  D9      			exx
+ 569: 1923+4	F285  08      			ex	af,af'		; save flags because of the add hl,sp instruction
+ 569: 1927+4	F286  EB      			ex	de,hl
+ 569: 1931+10	F287  210000  			ld	hl,0		; copy old sp to iy
+ 569: 1941+11	F28A  39      			add	hl,sp
+ 569: 1952+4	F28B  08      			ex	af,af'
+ 569: 1956+4	F28C  D9      			exx
+ 569:     -	F28D          	.endm
+ 569:     -	F28D          			SPTHREAD_BEGIN
+ 569: 1960+10	F28D  3191F2  			ld	sp,.?a0005
+ 569: 1970+10	F290  C9      			ret
+ 569:     -	F291          		.?a0005:
+ 569:     -	F291          	.endm
+ 569:     -	F291          	.endm
+ 570:     -	F291  81F2    	                dw rlc_e
+ 571:				                ; dw m2_drivelight_on
+ 572:     -	F293  85F1    	                dw fdc_select_d0s0
+ 573:     -	F295  16F7A1F2	                dw spt_jp_c, .long
+ 574:     -	F299  4DF20020	                dw spt_pause, $2000
+ 575:     -	F29D  0FF7A5F2	                dw spt_jp, .off
+ 576:     -	F2A1          	        .long:
+ 577:     -	F2A1  4DF2FFFF	                dw spt_pause, $FFFF
+ 578:     -	F2A5          	        .off:
+ 579:				                ; dw m2_drivelight_off
+ 580:     -	F2A5  81F1    	                dw fdc_select_none
+ 581:     -	F2A7  4DF20080	                dw spt_pause, $8000
+ 582:     -	F2AB  0AF7    	                dw spt_exit
+ 583:				                
+ 584:				
+ 585:     -	F2AD          	sptc_blink_biterrs:
+ 586:     -	F2AD  84F2    	                dw spt_blink_bit_rl
+ 587:     -	F2AF  84F2    	                dw spt_blink_bit_rl
+ 588:     -	F2B1  84F2    	                dw spt_blink_bit_rl
+ 589:     -	F2B3  84F2    	                dw spt_blink_bit_rl
+ 590:     -	F2B5  84F2    	                dw spt_blink_bit_rl
+ 591:     -	F2B7  84F2    	                dw spt_blink_bit_rl
+ 592:     -	F2B9  84F2    	                dw spt_blink_bit_rl
+ 593:     -	F2BB  84F2    	                dw spt_blink_bit_rl
+ 594:     -	F2BD  4DF20000	                dw spt_pause, $00
+ 595:				                ; dw spt_pause, $00
+ 596:				                ; dw spt_pause, $00
+ 597:     -	F2C1  4EF2    	                dw pause_bc
+ 598:     -	F2C3  4EF2    	                dw pause_bc
+ 599:     -	F2C5  0AF7    	                dw spt_exit
+ 600:				
+ 601:				; ld_a_0:
+ 602:				;               ld      a,0
+ 603:				;               ret
+ 604:				
+ 605:     -	F2C7          	sptc_print_charset:
+ 606:				                ; MAC_SPT_CON_GOTO 20,-8
+ 607:				                ; dw ld_a_0
+ 608:     -	F2C7  D1F2    	                dw spt_charset_64_p16_start
+ 609:     -	F2C9  D5F2    	                dw spt_charset_64_p16
+ 610:     -	F2CB  D5F2    	                dw spt_charset_64_p16
+ 611:     -	F2CD  D5F2    	                dw spt_charset_64_p16
+ 612:     -	F2CF  0AF7    	                dw spt_exit
+ 613:				
+ 614:     -	F2D1          	spt_charset_64_p16_start:
+ 615: 1980+10	F2D1  2138FE  	                ld      hl,VBASE+(VLINE*20)-8
+ 616: 1990+4	F2D4  AF      	                xor     a
+ 617:     -	F2D5          	spt_charset_64_p16:
+ 618: 1994+10	F2D5  011000  	                ld      bc,$10
+ 619: 2004+11	F2D8  09      	                add     hl,bc
+ 620: 2015+10	F2D9  014000  	                ld      bc,$40
+ 621:				                ; ld    bc,$10
+ 622:				                ; add   ix,bc
+ 623:				                ; ld    bc,$40
+ 624: 2025+12	F2DC  1806    	                jr      charset_here
+ 625:     -	F2DE          	chartest_fullscreen:
+ 626: 2037+10	F2DE  2100F8  	                ld      hl,VBASE
+ 627:				                ; ld    ix,VBASE
+ 628: 2047+10	F2E1  010008  	                ld      bc,VSIZE
+ 629:     -	F2E4          	charset_here:
+ 630:     -	F2E4          	        .charloop:
+ 631: 2057+7	F2E4  77      	                ld      (hl),a
+ 632:				                ; ld    (ix+0),a        ; copy A to byte pointed by HL
+ 633: 2064+4	F2E5  3C      	                inc     a               ; increments A
+ 634:				                ; inc   ix
+ 635: 2068+16	F2E6  EDA1    	                cpi                     ; increments HL, decrements BC (and does a CP)
+ 636: 2084+10	F2E8  EAE4F2  	                jp      pe, .charloop
+ 637: 2094+10	F2EB  C9      	                ret
+ 638:				
+ 639:				
+ 640:				; V_END = (VBASE+VSIZE-1)
+ 641:				
+ 642:				
+ 643:				
+ 644:				; msg_boot:     dbz "Booting "
+ 645:				; msg_hd:               dbz "HD"
+ 646:				; msg_fd:               dbz "FD"
+ 647:				
+ 648:     -	F2EC          	labels_start:
+ 649:     -	F2EC          	label_vram:     dbz     " 2K VRAM "
+ 649:     -	F2EC  20324B20			db " 2K VRAM ", 0
+	              5652414D
+	              2000
+ 649:     -	F2F6          	.endm
+ 650:     -	F2F6          	label_dram16:   dbz     "16K DRAM "
+ 650:     -	F2F6  31364B20			db "16K DRAM ", 0
+	              4452414D
+	              2000
+ 650:     -	F300          	.endm
+ 651:     -	F300          	label_bank16:   dbz     "16K page "
+ 651:     -	F300  31364B20			db "16K page ", 0
+	              70616765
+	              2000
+ 651:     -	F30A          	.endm
+ 652:				
+ 653:     -	F30A          	msg_dash:       dbz     "-"
+ 653:     -	F30A  2D00    			db "-", 0
+ 653:     -	F30C          	.endm
+ 654:     -	F30C          	msg_space:      dbz     " "
+ 654:     -	F30C  2000    			db " ", 0
+ 654:     -	F30E          	.endm
+ 655:     -	F30E          	msg_banner:     dbiz    "TRS-80 M12/M16B Banked CPM Memory Test - Frank / Dave / Black"
+ 655:     -	F30E          			dbi "TRS-80 M12/M16B Banked CPM Memory Test - Frank / Dave / Black"
+ 655:					irpc char,<TRS-80 M12/M16B Banked CPM Memory Test - Frank / Dave / Black>
+ 655:     -	F30E  D4      			db	'T'|$80
+ 655:     -	F30F          		.endm
+ 655:     -	F30F  D2      			db	'R'|$80
+ 655:     -	F310          		.endm
+ 655:     -	F310  D3      			db	'S'|$80
+ 655:     -	F311          		.endm
+ 655:     -	F311  AD      			db	'-'|$80
+ 655:     -	F312          		.endm
+ 655:     -	F312  B8      			db	'8'|$80
+ 655:     -	F313          		.endm
+ 655:     -	F313  B0      			db	'0'|$80
+ 655:     -	F314          		.endm
+ 655:     -	F314  A0      			db	' '|$80
+ 655:     -	F315          		.endm
+ 655:     -	F315  CD      			db	'M'|$80
+ 655:     -	F316          		.endm
+ 655:     -	F316  B1      			db	'1'|$80
+ 655:     -	F317          		.endm
+ 655:     -	F317  B2      			db	'2'|$80
+ 655:     -	F318          		.endm
+ 655:     -	F318  AF      			db	'/'|$80
+ 655:     -	F319          		.endm
+ 655:     -	F319  CD      			db	'M'|$80
+ 655:     -	F31A          		.endm
+ 655:     -	F31A  B1      			db	'1'|$80
+ 655:     -	F31B          		.endm
+ 655:     -	F31B  B6      			db	'6'|$80
+ 655:     -	F31C          		.endm
+ 655:     -	F31C  C2      			db	'B'|$80
+ 655:     -	F31D          		.endm
+ 655:     -	F31D  A0      			db	' '|$80
+ 655:     -	F31E          		.endm
+ 655:     -	F31E  C2      			db	'B'|$80
+ 655:     -	F31F          		.endm
+ 655:     -	F31F  E1      			db	'a'|$80
+ 655:     -	F320          		.endm
+ 655:     -	F320  EE      			db	'n'|$80
+ 655:     -	F321          		.endm
+ 655:     -	F321  EB      			db	'k'|$80
+ 655:     -	F322          		.endm
+ 655:     -	F322  E5      			db	'e'|$80
+ 655:     -	F323          		.endm
+ 655:     -	F323  E4      			db	'd'|$80
+ 655:     -	F324          		.endm
+ 655:     -	F324  A0      			db	' '|$80
+ 655:     -	F325          		.endm
+ 655:     -	F325  C3      			db	'C'|$80
+ 655:     -	F326          		.endm
+ 655:     -	F326  D0      			db	'P'|$80
+ 655:     -	F327          		.endm
+ 655:     -	F327  CD      			db	'M'|$80
+ 655:     -	F328          		.endm
+ 655:     -	F328  A0      			db	' '|$80
+ 655:     -	F329          		.endm
+ 655:     -	F329  CD      			db	'M'|$80
+ 655:     -	F32A          		.endm
+ 655:     -	F32A  E5      			db	'e'|$80
+ 655:     -	F32B          		.endm
+ 655:     -	F32B  ED      			db	'm'|$80
+ 655:     -	F32C          		.endm
+ 655:     -	F32C  EF      			db	'o'|$80
+ 655:     -	F32D          		.endm
+ 655:     -	F32D  F2      			db	'r'|$80
+ 655:     -	F32E          		.endm
+ 655:     -	F32E  F9      			db	'y'|$80
+ 655:     -	F32F          		.endm
+ 655:     -	F32F  A0      			db	' '|$80
+ 655:     -	F330          		.endm
+ 655:     -	F330  D4      			db	'T'|$80
+ 655:     -	F331          		.endm
+ 655:     -	F331  E5      			db	'e'|$80
+ 655:     -	F332          		.endm
+ 655:     -	F332  F3      			db	's'|$80
+ 655:     -	F333          		.endm
+ 655:     -	F333  F4      			db	't'|$80
+ 655:     -	F334          		.endm
+ 655:     -	F334  A0      			db	' '|$80
+ 655:     -	F335          		.endm
+ 655:     -	F335  AD      			db	'-'|$80
+ 655:     -	F336          		.endm
+ 655:     -	F336  A0      			db	' '|$80
+ 655:     -	F337          		.endm
+ 655:     -	F337  C6      			db	'F'|$80
+ 655:     -	F338          		.endm
+ 655:     -	F338  F2      			db	'r'|$80
+ 655:     -	F339          		.endm
+ 655:     -	F339  E1      			db	'a'|$80
+ 655:     -	F33A          		.endm
+ 655:     -	F33A  EE      			db	'n'|$80
+ 655:     -	F33B          		.endm
+ 655:     -	F33B  EB      			db	'k'|$80
+ 655:     -	F33C          		.endm
+ 655:     -	F33C  A0      			db	' '|$80
+ 655:     -	F33D          		.endm
+ 655:     -	F33D  AF      			db	'/'|$80
+ 655:     -	F33E          		.endm
+ 655:     -	F33E  A0      			db	' '|$80
+ 655:     -	F33F          		.endm
+ 655:     -	F33F  C4      			db	'D'|$80
+ 655:     -	F340          		.endm
+ 655:     -	F340  E1      			db	'a'|$80
+ 655:     -	F341          		.endm
+ 655:     -	F341  F6      			db	'v'|$80
+ 655:     -	F342          		.endm
+ 655:     -	F342  E5      			db	'e'|$80
+ 655:     -	F343          		.endm
+ 655:     -	F343  A0      			db	' '|$80
+ 655:     -	F344          		.endm
+ 655:     -	F344  AF      			db	'/'|$80
+ 655:     -	F345          		.endm
+ 655:     -	F345  A0      			db	' '|$80
+ 655:     -	F346          		.endm
+ 655:     -	F346  C2      			db	'B'|$80
+ 655:     -	F347          		.endm
+ 655:     -	F347  EC      			db	'l'|$80
+ 655:     -	F348          		.endm
+ 655:     -	F348  E1      			db	'a'|$80
+ 655:     -	F349          		.endm
+ 655:     -	F349  E3      			db	'c'|$80
+ 655:     -	F34A          		.endm
+ 655:     -	F34A  EB      			db	'k'|$80
+ 655:     -	F34B          		.endm
+ 655:     -	F34B          	.endm
+ 655:     -	F34B  00      			db 0
+ 655:     -	F34C          	.endm
+ 656:     -	F34C          	msg_testok:     dbz     " --OK-- "
+ 656:     -	F34C  202D2D4F			db " --OK-- ", 0
+	              4B2D2D20
+	              00
+ 656:     -	F355          	.endm
+ 657:				; msg_reloc:    dbz     "(reloc) "
+ 658:     -	F355          	msg_skipped:    dbz     " *skip* "
+ 658:     -	F355  202A736B			db " *skip* ", 0
+	              69702A20
+	              00
+ 658:     -	F35E          	.endm
+ 659:     -	F35E          	msg_biterrs:    dbz     " errors:"
+ 659:     -	F35E  20657272			db " errors:", 0
+	              6F72733A
+	              00
+ 659:     -	F367          	.endm
+ 660:     -	F367          	msg_absent:     dbz     " absent:"
+ 660:     -	F367  20616273			db " absent:", 0
+	              656E743A
+	              00
+ 660:     -	F370          	.endm
+ 661:     -	F370          	msg_dup:        dbz     "  DUP "
+ 661:     -	F370  20204455			db "  DUP ", 0
+	              502000
+ 661:     -	F377          	.endm
+ 662:     -	F377  20      	msg_testing:    db      " "
+ 663:     -	F378          	                dbi     " TEST "
+ 663:					irpc char,< TEST >
+ 663:     -	F378  A0      			db	' '|$80
+ 663:     -	F379          		.endm
+ 663:     -	F379  D4      			db	'T'|$80
+ 663:     -	F37A          		.endm
+ 663:     -	F37A  C5      			db	'E'|$80
+ 663:     -	F37B          		.endm
+ 663:     -	F37B  D3      			db	'S'|$80
+ 663:     -	F37C          		.endm
+ 663:     -	F37C  D4      			db	'T'|$80
+ 663:     -	F37D          		.endm
+ 663:     -	F37D  A0      			db	' '|$80
+ 663:     -	F37E          		.endm
+ 663:     -	F37E          	.endm
+ 664:     -	F37E          	                dbz     " "
+ 664:     -	F37E  2000    			db " ", 0
+ 664:     -	F380          	.endm
+ 665:				; msg_testing:  db " ", " "+$80, "t"+$80, "e"+$80, "s"+$80, "t"+$80, " "+$80, " ", 0
+ 666:     -	0008          	status_backup equ $-msg_testing-1
+ 667:				
+ 668:				; test parameter table. 2-byte entries:
+ 669:				; 1. size of test in bytes
+ 670:				; 2. starting address
+ 671:				; 3. bank to map before test
+ 672:				; 4. location in screen memory to start printing test data
+ 673:				; 5. address of string for announcing test
+ 674:				; tp_entrysize equ 10
+ 675:     -	0006          	tp_entrysize equ tp_low-tp_vram
+ 676:				
+ 677:     -	0002          	COL1 = 2
+ 678:     -	002A          	COL2 = (COL1+40)
+ 679:				
+ 680:     -	0000          	TP_SIZE equ 0
+ 681:     -	0001          	TP_BASE equ 1
+ 682:     -	0002          	TP_BANK equ 2
+ 683:     -	0003          	TP_LABEL equ 3
+ 684:     -	0004          	TP_POS equ 4
+ 685:     -	0001          	TP_GOTO equ 1
+ 686:				
+ 687:				memtest_ld_bc_size .macro
+ 688:				                ld      b,(iy+TP_SIZE)
+ 689:				                ld      c,a
+ 690:				.endm
+ 691:				
+ 692:				memtest_ld_hl_base .macro
+ 693:				                ld      h,(iy+TP_BASE)
+ 694:				                ld      l,a
+ 695:				.endm
+ 696:				
+ 697:				memtest_loadregs .macro
+ 698:				                xor     a
+ 699:				                memtest_ld_bc_size
+ 700:				                memtest_ld_hl_base
+ 701:				.endm
+ 702:				
+ 703:				
+ 704:     -	F380  08F80100	tp_vram:        db      high VSIZE, high VBASE, $1, label_vram-labels_start
+ 705:     -	F384  A2F8    	                dw      VBASE+( 2*VLINE)+COL1
+ 706:				
+ 707:     -	F386  4080010A	tp_low:         db      $40, $80, $1, label_dram16-labels_start
+ 708:     -	F38A  42F9    	                dw      VBASE+( 4*VLINE)+COL1
+ 709:     -	F38C  30C0010A	tp_rdest:       db      $30, $C0, $1, label_dram16-labels_start
+ 710:     -	F390  F2F8    	                dw      VBASE+( 3*VLINE)+COL1
+ 711:				
+ 712:     -	F392  40000014	tp_high:        db      $40, $00, $0, label_bank16-labels_start
+ 713:     -	F396  92F9    	                dw      VBASE+( 5*VLINE)+COL1
+ 714:     -	F398  40400014	                db      $40, $40, $0, label_bank16-labels_start
+ 715:     -	F39C  E2F9    	                dw      VBASE+( 6*VLINE)+COL1
+ 716:     -	F39E  40000214	                db      $40, $00, $2, label_bank16-labels_start
+ 717:     -	F3A2  32FA    	                dw      VBASE+( 7*VLINE)+COL1
+ 718:     -	F3A4  40400214	                db      $40, $40, $2, label_bank16-labels_start
+ 719:     -	F3A8  82FA    	                dw      VBASE+( 8*VLINE)+COL1
+ 720:     -	F3AA  40000314	                db      $40, $00, $3, label_bank16-labels_start
+ 721:     -	F3AE  D2FA    	                dw      VBASE+( 9*VLINE)+COL1
+ 722:     -	F3B0  40400314	                db      $40, $40, $3, label_bank16-labels_start
+ 723:     -	F3B4  22FB    	                dw      VBASE+(10*VLINE)+COL1
+ 724:     -	F3B6  40000414	                db      $40, $00, $4, label_bank16-labels_start
+ 725:     -	F3BA  72FB    	                dw      VBASE+(11*VLINE)+COL1
+ 726:     -	F3BC  40400414	                db      $40, $40, $4, label_bank16-labels_start
+ 727:     -	F3C0  C2FB    	                dw      VBASE+(12*VLINE)+COL1
+ 728:     -	F3C2  40000514	                db      $40, $00, $5, label_bank16-labels_start
+ 729:     -	F3C6  12FC    	                dw      VBASE+(13*VLINE)+COL1
+ 730:     -	F3C8  40400514	                db      $40, $40, $5, label_bank16-labels_start
+ 731:     -	F3CC  62FC    	                dw      VBASE+(14*VLINE)+COL1
+ 732:     -	F3CE  40000614	                db      $40, $00, $6, label_bank16-labels_start
+ 733:     -	F3D2  B2FC    	                dw      VBASE+(15*VLINE)+COL1
+ 734:     -	F3D4  40400614	                db      $40, $40, $6, label_bank16-labels_start
+ 735:     -	F3D8  02FD    	                dw      VBASE+(16*VLINE)+COL1
+ 736:     -	F3DA  40000714	                db      $40, $00, $7, label_bank16-labels_start
+ 737:     -	F3DE  52FD    	                dw      VBASE+(17*VLINE)+COL1
+ 738:     -	F3E0  40400714	                db      $40, $40, $7, label_bank16-labels_start
+ 739:     -	F3E4  A2FD    	                dw      VBASE+(18*VLINE)+COL1
+ 740:     -	F3E6  40000814	                db      $40, $00, $8, label_bank16-labels_start
+ 741:     -	F3EA  1AF9    	                dw      VBASE+( 3*VLINE)+COL2
+ 742:     -	F3EC  40400814	                db      $40, $40, $8, label_bank16-labels_start
+ 743:     -	F3F0  6AF9    	                dw      VBASE+( 4*VLINE)+COL2
+ 744:     -	F3F2  40000914	                db      $40, $00, $9, label_bank16-labels_start
+ 745:     -	F3F6  BAF9    	                dw      VBASE+( 5*VLINE)+COL2
+ 746:     -	F3F8  40400914	                db      $40, $40, $9, label_bank16-labels_start
+ 747:     -	F3FC  0AFA    	                dw      VBASE+( 6*VLINE)+COL2
+ 748:     -	F3FE  40000A14	                db      $40, $00, $A, label_bank16-labels_start
+ 749:     -	F402  5AFA    	                dw      VBASE+( 7*VLINE)+COL2
+ 750:     -	F404  40400A14	                db      $40, $40, $A, label_bank16-labels_start
+ 751:     -	F408  AAFA    	                dw      VBASE+( 8*VLINE)+COL2
+ 752:     -	F40A  40000B14	                db      $40, $00, $B, label_bank16-labels_start
+ 753:     -	F40E  FAFA    	                dw      VBASE+( 9*VLINE)+COL2
+ 754:     -	F410  40400B14	                db      $40, $40, $B, label_bank16-labels_start
+ 755:     -	F414  4AFB    	                dw      VBASE+(10*VLINE)+COL2
+ 756:     -	F416  40000C14	                db      $40, $00, $C, label_bank16-labels_start
+ 757:     -	F41A  9AFB    	                dw      VBASE+(11*VLINE)+COL2
+ 758:     -	F41C  40400C14	                db      $40, $40, $C, label_bank16-labels_start
+ 759:     -	F420  EAFB    	                dw      VBASE+(12*VLINE)+COL2
+ 760:     -	F422  40000D14	                db      $40, $00, $D, label_bank16-labels_start
+ 761:     -	F426  3AFC    	                dw      VBASE+(13*VLINE)+COL2
+ 762:     -	F428  40400D14	                db      $40, $40, $D, label_bank16-labels_start
+ 763:     -	F42C  8AFC    	                dw      VBASE+(14*VLINE)+COL2
+ 764:     -	F42E  40000E14	                db      $40, $00, $E, label_bank16-labels_start
+ 765:     -	F432  DAFC    	                dw      VBASE+(15*VLINE)+COL2
+ 766:     -	F434  40400E14	                db      $40, $40, $E, label_bank16-labels_start
+ 767:     -	F438  2AFD    	                dw      VBASE+(16*VLINE)+COL2
+ 768:     -	F43A  40000F14	                db      $40, $00, $F, label_bank16-labels_start
+ 769:     -	F43E  7AFD    	                dw      VBASE+(17*VLINE)+COL2
+ 770:     -	F440  40400F14	                db      $40, $40, $F, label_bank16-labels_start
+ 771:     -	F444  CAFD    	                dw      VBASE+(18*VLINE)+COL2
+ 772:     -	F446  00      	                db      $00 
+ 773:     -	F447  92F3    	                dw      tp_high
+ 774:				
+ 775:				
+ 776:				
+ 777:     -	F449          	relocate_memtest:
+ 778: 2104+10	F449  1155F4  	                ld      de,reloc_dst_begin
+ 779: 2114+10	F44C  2155F4  	                ld      hl,reloc_src_begin
+ 780: 2124+10	F44F  01D500  	                ld      bc,reloc_size
+ 781: 2134+16+5	F452  EDB0    	                ldir
+ 782: 2150+10	F454  C9      	                ret
+ 783:				
+ 784:				; ----------------------------------------------------------------------------
+ 785:				; Relocated tests:
+ 786:				; The code below is assembled to be relocated to $4100.  It contains threaded
+ 787:				; code which cannot be written in a position-independent manner (consisting
+ 788:				; mostly of absolute subroutine addresses).  So we use the assembler's 
+ 789:				; .phase directive to tell it to assemble for operation when moved to $4000.
+ 790:				; This code should unmap the ROM from the region starting at $0000, perform
+ 791:				; the memory test, then remap the ROM and return execution there via the
+ 792:				; normal mechanism.  The rest of ROM will not be visible during this, so no
+ 793:				; calls back into it can happen until the ROM is remapped, and no data
+ 794:				; from it can be seen either (hence an extra copy of the label).
+ 795:     -	F455          	reloc_src_begin:
+ 796:				;                .phase $4100
+ 797:     -	F455          	reloc_dst_begin:
+ 798:     -	F455          	sptc_relocated_test:
+ 799:     -	F455  5DF4    	                dw rom_unmap
+ 800:     -	F457  6CF4    	                dw relocated_memtest
+ 801:     -	F459  61F4    	                dw rom_map
+ 802:     -	F45B  0AF7    	                dw spt_exit
+ 803:				
+ 804:     -	F45D          	rom_unmap:
+ 805: 2160+4	F45D  AF      	                xor     a
+ 806: 2164+11	F45E  D3F9    	                out     ($F9),a
+ 807: 2175+10	F460  C9      	                ret
+ 808:				
+ 809:     -	F461          	rom_map:
+ 810: 2185+7	F461  3E01    	                ld      a,1
+ 811: 2192+4	F463  00      	                nop
+ 812: 2196+4	F464  00      	                nop
+ 813: 2200+10	F465  C9      	                ret
+ 814:				
+ 815:     -	F466  4080010A	tp_low_reloc:   db      $40, $80, $1, label_dram16-labels_start
+ 816:     -	F46A  42F9    	                dw      VBASE+( 4*VLINE)+COL1
+ 817:				
+ 818:     -	F46C          	relocated_memtest:
+ 819:				;                .dephase
+ 820:				
+ 821:				.include "inc/memtestmarch.asm"
+**** inc/memtestmarch.asm ****
+   1:				; code: language=asm-collection tabSize=8
+   2:				; Requirements:
+   3:				; This function must be RELOCATABLE (only relative jumps), and use NO RAM or STACK.
+   4:				; These restrictions lead to somewhat long-winded, repetative code.
+   5:				
+   6:				;; March C- algorithm:
+   7:				;;  1: (up w0) write each location bottom to top with test value
+   8:				;;  2: (up r0,w1) read each location bottom to top, compare to test value, then write complement
+   9:				;;  3: (up r1,w0) read each location bottom to top, compare to complement, then write test value
+  10:				;;  4: (dn r0,w1) read each location top to bottom, compare to test value, then write complement
+  11:				;;  5: (dn r1,w0) read each location top to bottom, compare to complement, then write test value
+  12:				;;  6: (dn r0) read each location top to bottom, compare to test value
+  13:				
+  14:				; Arguments:
+  15:				;	hl = current memory position under test
+  16:				;	bc = bytes remaining to test
+  17:				;	iy = test data structure
+  18:				; returns:
+  19:				;	e = all errored bits found in this block/bank/range of memory
+  20:				; destroys: a,bc,d,hl
+  21:				; preserves: ix
+  22:				
+  23:     -	F46C          	memtestmarch:
+  24: 2210+4	F46C  AF      			xor	a
+  25: 2214+4	F46D  5F      			ld	e,a			; reset error accumulator
+  26: 2218+4	F46E  57      			ld	d,a			; set the first testing value to 0
+  27:				
+  28:     -	F46F          		checkabsent:					; quick test for completely missing bank
+  29:     -	F46F          			memtest_ld_hl_base
+  29: 2222+19	F46F  FD6601  	                ld      h,(iy+TP_BASE)
+  29: 2241+4	F472  6F      	                ld      l,a
+  29:     -	F473          	.endm
+  30: 2245+4	F473  44      			ld	b,h
+  31: 2249+7	F474  0E01    			ld	c,1
+  32: 2256+4	F476  2F      			cpl				; A := FF
+  33: 2260+7	F477  77      		.redo	ld	(hl),a			; write FF to base
+  34: 2267+4	F478  2F      			cpl				; A := 0
+  35: 2271+7	F479  02      			ld	(bc),a			; write 00 to base+1
+  36: 2278+7	F47A  BE      			cp	(hl)			; compare to base (should be FF, should not match)
+  37: 2285+7+5	F47B  2806    			jr	z,.allbad		; if they match, all bits are bad, but double-check
+  38: 2292+7	F47D  FE00    			cp	0			; are we on the first round?
+  39: 2299+7+5	F47F  28F6    			jr	z,.redo			; yes, redo with reversed bits
+  40: 2306+12	F481  1804    			jr	mtm1
+  41:     -	F483          		.allbad:
+  42: 2318+7	F483  1EFF    			ld	e,$FF			; report all bits bad
+  43: 2325+12	F485  1844    			jr	mtm_done_bounce
+  44:				
+  45:     -	F487          		mtm1:
+  46:     -	F487          			memtest_loadregs
+  46: 2337+4	F487  AF      	                xor     a
+  46:     -	F488          	                memtest_ld_bc_size
+  46: 2341+19	F488  FD4600  	                ld      b,(iy+TP_SIZE)
+  46: 2360+4	F48B  4F      	                ld      c,a
+  46:     -	F48C          	.endm
+  46:     -	F48C          	                memtest_ld_hl_base
+  46: 2364+19	F48C  FD6601  	                ld      h,(iy+TP_BASE)
+  46: 2383+4	F48F  6F      	                ld      l,a
+  46:     -	F490          	.endm
+  46:     -	F490          	.endm
+  47:     -	F490          		mtm1loop:				; fill initial value upwards
+  48: 2387+7	F490  72      			ld	(hl),d
+  49: 2394+6	F491  23      			inc	hl
+  50: 2400+6	F492  0B      			dec	bc
+  51: 2406+4	F493  79      			ld	a,c
+  52: 2410+4	F494  B0      			or	b
+  53: 2414+7+5	F495  20F9    			jr	nz,mtm1loop
+  54:     -	F497          		mtm2:					; read value, write complement upwards
+  55:     -	F497          			memtest_loadregs
+  55: 2421+4	F497  AF      	                xor     a
+  55:     -	F498          	                memtest_ld_bc_size
+  55: 2425+19	F498  FD4600  	                ld      b,(iy+TP_SIZE)
+  55: 2444+4	F49B  4F      	                ld      c,a
+  55:     -	F49C          	.endm
+  55:     -	F49C          	                memtest_ld_hl_base
+  55: 2448+19	F49C  FD6601  	                ld      h,(iy+TP_BASE)
+  55: 2467+4	F49F  6F      	                ld      l,a
+  55:     -	F4A0          	.endm
+  55:     -	F4A0          	.endm
+  56:     -	F4A0          		mtm2loop:
+  57: 2471+7	F4A0  7E      			ld	a,(hl)
+  58: 2478+4	F4A1  BA      			cp	d			; compare to value
+  59: 2482+7+5	F4A2  2804    			jr	z, mtm2cont		; memory changed, report
+  60: 2489+4	F4A4  AA      			xor	d			; calculate errored bits
+  61: 2493+4	F4A5  B3      			or	e				
+  62: 2497+4	F4A6  5F      			ld	e,a			; save error bits to e
+  63: 2501+4	F4A7  7A      			ld	a,d			; reload a with correct value
+  64:     -	F4A8          		mtm2cont:
+  65: 2505+4	F4A8  2F      			cpl				; take the complement
+  66: 2509+7	F4A9  77      			ld	(hl),a			; write the complement
+  67: 2516+6	F4AA  23      			inc	hl
+  68: 2522+6	F4AB  0B      			dec	bc
+  69: 2528+4	F4AC  79      			ld	a,c
+  70: 2532+4	F4AD  B0      			or	b
+  71: 2536+7+5	F4AE  20F0    			jr	nz,mtm2loop
+  72:						
+  73:     -	F4B0          		mtm3:					; read complement, write original value upwards
+  74:     -	F4B0          			memtest_loadregs
+  74: 2543+4	F4B0  AF      	                xor     a
+  74:     -	F4B1          	                memtest_ld_bc_size
+  74: 2547+19	F4B1  FD4600  	                ld      b,(iy+TP_SIZE)
+  74: 2566+4	F4B4  4F      	                ld      c,a
+  74:     -	F4B5          	.endm
+  74:     -	F4B5          	                memtest_ld_hl_base
+  74: 2570+19	F4B5  FD6601  	                ld      h,(iy+TP_BASE)
+  74: 2589+4	F4B8  6F      	                ld      l,a
+  74:     -	F4B9          	.endm
+  74:     -	F4B9          	.endm
+  75:     -	F4B9          		mtm3loop:
+  76: 2593+7	F4B9  7E      			ld	a,(hl)
+  77: 2600+4	F4BA  2F      			cpl
+  78: 2604+4	F4BB  BA      			cp	d			; compare to the complement
+  79: 2608+7+5	F4BC  2804    			jr	z, mtm3cont		; memory changed, report
+  80: 2615+4	F4BE  AA      			xor	d			; calculate errored bits
+  81: 2619+4	F4BF  B3      			or	e				
+  82: 2623+4	F4C0  5F      			ld	e,a			; save error bits to e
+  83: 2627+4	F4C1  7A      			ld	a,d			; reload a with correct value
+  84:     -	F4C2          		mtm3cont:
+  85: 2631+7	F4C2  72      			ld	(hl),d			; fill with test value
+  86: 2638+6	F4C3  23      			inc	hl
+  87: 2644+6	F4C4  0B      			dec	bc
+  88: 2650+4	F4C5  79      			ld	a,c
+  89: 2654+4	F4C6  B0      			or	b
+  90: 2658+7+5	F4C7  20F0    			jr	nz,mtm3loop
+  91: 2665+12	F4C9  1804    			jr	mtm4
+  92:					
+  93:     -	F4CB          		mtm_done_bounce:
+  94: 2677+12	F4CB  1858    			jr	mtm_done
+  95:     -	F4CD          		mtm1_bounce:
+  96: 2689+12	F4CD  18B8    			jr	mtm1
+  97:				
+  98:     -	F4CF          		mtm4:					; read test value, write complement downwards
+  99:     -	F4CF          			memtest_loadregs
+  99: 2701+4	F4CF  AF      	                xor     a
+  99:     -	F4D0          	                memtest_ld_bc_size
+  99: 2705+19	F4D0  FD4600  	                ld      b,(iy+TP_SIZE)
+  99: 2724+4	F4D3  4F      	                ld      c,a
+  99:     -	F4D4          	.endm
+  99:     -	F4D4          	                memtest_ld_hl_base
+  99: 2728+19	F4D4  FD6601  	                ld      h,(iy+TP_BASE)
+  99: 2747+4	F4D7  6F      	                ld      l,a
+  99:     -	F4D8          	.endm
+  99:     -	F4D8          	.endm
+ 100: 2751+11	F4D8  09      			add	hl,bc			; move to end of the test area
+ 101: 2762+6	F4D9  2B      			dec	hl
+ 102:     -	F4DA          		mtm4loop:
+ 103: 2768+7	F4DA  7E      			ld	a,(hl)
+ 104: 2775+4	F4DB  BA      			cp	d			; compare to value
+ 105: 2779+7+5	F4DC  2804    			jr	z, mtm4cont
+ 106: 2786+4	F4DE  AA      			xor	d			; calculate errored bits
+ 107: 2790+4	F4DF  B3      			or	e				
+ 108: 2794+4	F4E0  5F      			ld	e,a			; save error bits to e
+ 109: 2798+4	F4E1  7A      			ld	a,d			; reload a with correct value
+ 110:     -	F4E2          		mtm4cont:
+ 111: 2802+4	F4E2  2F      			cpl				; take the complement
+ 112: 2806+7	F4E3  77      			ld	(hl),a			; write complement
+ 113: 2813+6	F4E4  2B      			dec	hl
+ 114: 2819+6	F4E5  0B      			dec	bc
+ 115: 2825+4	F4E6  79      			ld	a,c
+ 116: 2829+4	F4E7  B0      			or	b
+ 117: 2833+7+5	F4E8  20F0    			jr	nz,mtm4loop
+ 118:				
+ 119:     -	F4EA          		mtm5:					; read complement, write value downwards
+ 120:     -	F4EA          			memtest_loadregs
+ 120: 2840+4	F4EA  AF      	                xor     a
+ 120:     -	F4EB          	                memtest_ld_bc_size
+ 120: 2844+19	F4EB  FD4600  	                ld      b,(iy+TP_SIZE)
+ 120: 2863+4	F4EE  4F      	                ld      c,a
+ 120:     -	F4EF          	.endm
+ 120:     -	F4EF          	                memtest_ld_hl_base
+ 120: 2867+19	F4EF  FD6601  	                ld      h,(iy+TP_BASE)
+ 120: 2886+4	F4F2  6F      	                ld      l,a
+ 120:     -	F4F3          	.endm
+ 120:     -	F4F3          	.endm
+ 121: 2890+11	F4F3  09      			add	hl,bc			; move to end of the test area
+ 122: 2901+6	F4F4  2B      			dec	hl
+ 123:     -	F4F5          		mtm5loop:
+ 124: 2907+7	F4F5  7E      			ld	a,(hl)
+ 125: 2914+4	F4F6  2F      			cpl
+ 126: 2918+4	F4F7  BA      			cp	d
+ 127: 2922+7+5	F4F8  2804    			jr	z, mtm5cont
+ 128: 2929+4	F4FA  AA      			xor	d			; calculate errored bits
+ 129: 2933+4	F4FB  B3      			or	e				
+ 130: 2937+4	F4FC  5F      			ld	e,a			; save error bits to e
+ 131: 2941+4	F4FD  7A      			ld	a,d			; reload a with correct value
+ 132:     -	F4FE          		mtm5cont:
+ 133: 2945+7	F4FE  72      			ld	(hl),d
+ 134: 2952+6	F4FF  2B      			dec	hl
+ 135: 2958+6	F500  0B      			dec	bc
+ 136: 2964+4	F501  79      			ld	a,c
+ 137: 2968+4	F502  B0      			or	b
+ 138: 2972+7+5	F503  20F0    			jr	nz,mtm5loop
+ 139:					
+ 140:     -	F505          		mtm6:					; final check that all are zero
+ 141:     -	F505          			memtest_loadregs
+ 141: 2979+4	F505  AF      	                xor     a
+ 141:     -	F506          	                memtest_ld_bc_size
+ 141: 2983+19	F506  FD4600  	                ld      b,(iy+TP_SIZE)
+ 141: 3002+4	F509  4F      	                ld      c,a
+ 141:     -	F50A          	.endm
+ 141:     -	F50A          	                memtest_ld_hl_base
+ 141: 3006+19	F50A  FD6601  	                ld      h,(iy+TP_BASE)
+ 141: 3025+4	F50D  6F      	                ld      l,a
+ 141:     -	F50E          	.endm
+ 141:     -	F50E          	.endm
+ 142: 3029+11	F50E  09      			add	hl,bc			; move to end of the test area
+ 143: 3040+6	F50F  2B      			dec	hl
+ 144:     -	F510          		mtm6loop:
+ 145: 3046+7	F510  7E      			ld	a,(hl)
+ 146: 3053+4	F511  BA      			cp	d
+ 147: 3057+7+5	F512  2804    			jr	z,mtm6cont
+ 148: 3064+4	F514  AA      			xor	d			; calculate errored bits
+ 149: 3068+4	F515  B3      			or	e				
+ 150: 3072+4	F516  5F      			ld	e,a			; save error bits to e
+ 151: 3076+4	F517  7A      			ld	a,d			; reload a with correct value
+ 152:     -	F518          		mtm6cont:
+ 153: 3080+6	F518  2B      			dec	hl
+ 154: 3086+6	F519  0B      			dec	bc
+ 155: 3092+4	F51A  79      			ld	a,c
+ 156: 3096+4	F51B  B0      			or	b
+ 157: 3100+7+5	F51C  20F2    			jr	nz,mtm6loop
+ 158:				
+ 159:     -	F51E          		mtmredo:
+ 160: 3107+4	F51E  7A      			ld	a,d	
+ 161: 3111+7	F51F  FE00    			cp	0			; if our test value is 0
+ 162: 3118+7	F521  1655    			ld	d,$55
+ 163: 3125+7+5	F523  28A8    			jr	z,mtm1_bounce		; then rerun the tests with value $55
+ 164:				
+ 165:     -	F525          		mtm_done:
+ 166: 3132+4	F525  97      			sub	a			; set carry flag if e is nonzero
+ 167: 3136+4	F526  B3      			or	e
+ 168:     -	F527          		mtm_return:
+ 169: 3140+5+6	F527  C8      			ret	z
+ 170: 3145+4	F528  37      			scf
+ 171: 3149+10	F529  C9      			ret
+ 172:				
+ 173:     -	F52A          	memtestmarch_end equ $
+ 174:				;-----------------------------------------------------------------------------
+**** trs80m12diagcpm.asm ****
+ 822:				
+ 823:     -	00D5          	reloc_size equ relocated_memtest - reloc_dst_begin + $ - memtestmarch
+ 824:				
+ 825:				; End of relocated section. 
+ 826:				; (But note, the code will place a copy of the memtestmarch routine right 
+ 827:				; after the above code.  That routine is written in position-independent code
+ 828:				; aka relocatable code in Z80 terminology.  We need this RAM copy while
+ 829:				; testing the RAM that is mapped behind the ROM at location $0000.)
+ 830:				; ----------------------------------------------------------------------------
+ 831:				
+ 832:				.include "inc/trs80m2fdcboot.asm"
+**** inc/trs80m2fdcboot.asm ****
+   1:				; code: language=asm-collection tabSize=8
+   2:				
+   3:				; .include "inc/m2.inc"
+   4:				
+   5:				;;;;----------------------------------------------------------------------------------------------
+   6:				;;;; boot_hd0
+   7:				;;;;----------------------------------------------------------------------------------------------
+   8:				
+   9:     -	F52A          	boot_hd0:
+  10: 3159+7	F52A  3E80    			ld	a,$80			; map bank 1 and VRAM just in case
+  11: 3166+11	F52C  D3FF    			out	($FF),a
+  12:				
+  13: 3177+10	F52E  310028  			ld	sp,hd_stack_init
+  14:				
+  15: 3187+10	F531  114844  			ld	de,'HD';|$8080
+  16: 3197+17	F534  CDC2F6  			call	show_boot_message
+  17:				
+  18: 3214+7	F537  1615    			ld	d,21	; loop up to 21 times waiting for controller ready
+  19:						; ld	bc,0
+  20:     -	F539          		.hd_wait_ready:
+  21: 3221+17	F539  CD7CF6  			call	delay_bc		; delay by 551 t-states (137.75us @4MHz)
+  22:				
+  23:						; Check if controller is ready
+  24:						; POSSIBLE BUG!  WD1000 documentation says that no other bits or registers
+  25:						; are valid if the busy bit of the status register is set, so it should
+  26:						; be checked here.
+  27: 3238+11	F53C  DBCF    			in	a,(hdc_status_reg)
+  28: 3249+8	F53E  CB77    			bit	hdc_status_bit_ready,a
+  29: 3257+7+5	F540  2008    			jr	nz,.hd_is_ready
+  30:				
+  31: 3264+4	F542  15      			dec	d
+  32: 3268+7+5	F543  20F4    			jr	nz,.hd_wait_ready
+  33: 3275+10	F545  114854  			ld	de,'HT'
+  34: 3285+12	F548  1864    			jr	show_boot_error
+  35:				
+  36:     -	F54A          		.hd_is_ready:
+  37:						; try to seek to track 5
+  38: 3297+7	F54A  3E20    			ld	a,hdc_sdh_sect_size_512
+  39: 3304+11	F54C  D3CE    			out	(hdc_size_drive_head_reg),a
+  40: 3315+4	F54E  AF      			xor	a
+  41: 3319+11	F54F  D3CD    			out	(hdc_cylinder_high_reg),a
+  42: 3330+7	F551  3E05    			ld	a,5
+  43: 3337+11	F553  D3CC    			out	(hdc_cylinder_low_reg),a
+  44: 3348+7	F555  3E7F    			ld	a,hdc_command_seek+hdc_command_step_rate_7p5_ms
+  45: 3355+11	F557  D3CF    			out	(hdc_command_reg),a
+  46: 3366+17	F559  CD8AF6  			call	hd_wait_not_busy
+  47:					
+  48:						; restore to track 0
+  49: 3383+7	F55C  3E1F    			ld	a,hdc_command_restore+hdc_command_step_rate_7p5_ms
+  50: 3390+11	F55E  D3CF    			out	(hdc_command_reg),a
+  51: 3401+17	F560  CD8AF6  			call	hd_wait_not_busy
+  52: 3418+7	F563  3E00    			ld	a,0
+  53: 3425+7+5	F565  2044    			jr	nz,hd_tr0_not_found
+  54:				
+  55: 3432+10	F567  210000  			ld	hl,hd_load_addr	; start loading HD sectors into memory at 0000
+  56:								; if we load 17 sectors, they'll occupy 0000-21ff
+  57:								; we MUST load at least 9 sectors, because we can't
+  58:								; detect the end signature below 1000 since the
+  59:								; RAM from 0000-0fff is overlaid by this boot ROM
+  60: 3442+10	F56A  01CB01  			ld	bc,(1*256)+hdc_sector_number_reg	; start w/ sector 1
+  61:				
+  62:     -	F56D          		.hd_read_sector:
+  63: 3452+4	F56D  54      			ld	d,h		; copy HL into DE for signature check
+  64: 3456+4	F56E  5D      			ld	e,l
+  65: 3460+12	F56F  ED41    			out	(c),b		; write sector register
+  66:				
+  67: 3472+7	F571  3E14    			ld	a,20		; allow no more than 19 sectors to be read
+  68: 3479+4	F573  B8      			cp	b		; else we will smash our stack
+  69: 3483+7+5	F574  382F    			jr	c,hd_err_no_sig
+  70:				
+  71: 3490+7	F576  3E20    			ld	a,hdc_command_read_sector_pio
+  72: 3497+11	F578  D3CF    			out	(hdc_command_reg),a
+  73: 3508+17	F57A  CD8AF6  			call	hd_wait_not_busy
+  74: 3525+7+5	F57D  202C    			jr	nz,hd_err_from_err_reg
+  75:				
+  76:     -	F57F          		.hd_wait_for_drq:
+  77: 3532+11	F57F  DBCF    			in	a,(hdc_status_reg)
+  78: 3543+8	F581  CB5F    			bit	hdc_status_bit_data_request,a
+  79: 3551+7+5	F583  28FA    			jr	z,.hd_wait_for_drq
+  80:						; call	check_escape_key
+  81:						; jr	z,floppy_boot
+  82:				
+  83: 3558+4	F585  04      			inc	b			; advance sector number
+  84: 3562+11	F586  C5      			push	bc			; and save it for next iteration
+  85: 3573+7	F587  3E02    			ld	a,2
+  86: 3580+10	F589  01C800  			ld	bc,(0*256)+hdc_data_reg
+  87: 3590+16+5	F58C  EDB2    			inir
+  88: 3606+16+5	F58E  EDB2    			inir
+  89:				
+  90: 3622+11	F590  E5      			push	hl			; check for end boot sig
+  91: 3633+10	F591  21E9F6  			ld	hl,hd_boot_end_sig
+  92: 3643+7	F594  060E    			ld	b,hd_boot_end_sig_len
+  93: 3650+17	F596  CD82F6  			call	check_disk_signature
+  94: 3667+10	F599  E1      			pop	hl
+  95: 3677+10	F59A  C1      			pop	bc
+  96: 3687+7+5	F59B  20D0    			jr	nz,.hd_read_sector	; end boot sig not found, continue read
+  97:				
+  98:						; ld	bc,0
+  99:						; call	delay_bc		; delay by 1,703,915 t-states (0.42597875 sec @ 4MHz)
+ 100:						; call	check_escape_key
+ 101:						; jr	z,floppy_boot
+ 102:				
+ 103: 3694+4	F59D  AF      			xor	a			; disable HD
+ 104: 3698+11	F59E  D3C1    			out	(hdc_control_reg),a
+ 105:				
+ 106: 3709+17	F5A0  CDE0F6  			call	boot_clear_screen
+ 107:				
+ 108: 3726+4	F5A3  EB      			ex	de,hl			; jump to location after end sig
+ 109: 3730+4	F5A4  E9      			jp	(hl)
+ 110:				
+ 111:     -	F5A5          	hd_err_no_sig:
+ 112: 3734+10	F5A5  115253  			ld	de,'RS'
+ 113: 3744+4	F5A8  AF      			xor	a
+ 114: 3748+12	F5A9  1803    			jr	show_boot_error
+ 115:     -	F5AB          	hd_err_from_err_reg:
+ 116:     -	F5AB          	hd_tr0_not_found:
+ 117: 3760+10	F5AB  114844  			ld	de,'HD'
+ 118:				
+ 119:				
+ 120:     -	FEAD          	boot_error_pos equ VBASE+(VLINE*21)+29
+ 121:     -	F5AE          	show_boot_error:
+ 122:						; call	con_clear
+ 123:				
+ 124: 3770+20	F5AE  ED53B9FE			ld	(boot_error_pos+boot_err_msg_len),de
+ 125: 3790+14	F5B2  DD21BCFE			ld	ix,boot_error_pos+boot_err_msg_len+3
+ 126:				
+ 127: 3804+4	F5B6  5F      			ld	e,a
+ 128: 3808+17	F5B7  CD6AF2  			call	print_biterrs
+ 129:				
+ 130: 3825+10	F5BA  21F7F6  			ld	hl,boot_err_msg
+ 131: 3835+10	F5BD  11ADFE  			ld	de,boot_error_pos
+ 132: 3845+10	F5C0  010C00  			ld	bc,boot_err_msg_len
+ 133: 3855+16+5	F5C3  EDB0    			ldir
+ 134:				
+ 135: 3871+17	F5C5  CD93F7  			call	con_cursor_off
+ 136: 3888+12	F5C8  18FE    		.spin:	jr .spin
+ 137:				
+ 138:				;;;;----------------------------------------------------------------------------------------------
+ 139:				;;;; boot_fd0
+ 140:				;;;;----------------------------------------------------------------------------------------------
+ 141:				
+ 142:     -	F5CA          	boot_fd0:
+ 143: 3900+7	F5CA  3E80    			ld	a,$80			; map bank 1 and VRAM just in case
+ 144: 3907+11	F5CC  D3FF    			out	($FF),a
+ 145:				
+ 146: 3918+10	F5CE  310020  			ld	sp,fd_stack_init	; etablish a stack
+ 147: 3928+4	F5D1  AF      			xor	a			; reset the HDC in case it was activated
+ 148: 3932+11	F5D2  D3C1    			out	(hdc_control_reg),a
+ 149:				
+ 150: 3943+10	F5D4  114644  			ld	de,'FD';|$8080
+ 151: 3953+17	F5D7  CDC2F6  			call	show_boot_message
+ 152:						; call	con_clear_kbd
+ 153:				
+ 154:     -	F5DA          		.fd_wait_ready:
+ 155: 3970+17	F5DA  CDACF6  			call	fd_wait_ready_d0s0
+ 156:						; call	fdc_select_d0s0
+ 157:				
+ 158:						; call	fdc_terminate_cmd
+ 159:						; bit	7,a
+ 160:						; jr	nz,.fd_wait_ready
+ 161:				
+ 162: 3987+17	F5DD  CD70F1  			call	fdc_terminate_cmd	; why this extra terminate?  Especially without a wait following?
+ 163:				
+ 164:						; step in 5 tracks
+ 165: 4004+17	F5E0  CD8EF1  			call	fdc_step_in_5
+ 166:						; call	fd_wait_ready
+ 167:						; seek back to track 0
+ 168: 4021+17	F5E3  CDA2F1  			call	fdc_head_restore
+ 169: 4038+17	F5E6  CDBBF6  			call	fd_wait_busy
+ 170: 4055+17	F5E9  CDB4F6  			call	fd_wait_ready
+ 171:				
+ 172:					; 	ld	bc,0
+ 173:					; 	ld	d,7
+ 174:					; .fd_restore_wait:	
+ 175:					; 	call	delay_bc			; delay by 206 t-states (0.01998875 sec @ 4MHz)
+ 176:					; 	dec	d
+ 177:					; 	jr	nz,.fd_restore_wait		; TODO: wait for drive ready, but with timeout
+ 178:				
+ 179:						; check FDC for errors
+ 180: 4072+11	F5EC  DBE4    			in	a,(fdc_status_reg)
+ 181: 4083+7	F5EE  EE04    			xor	fdc_status_track_zero	; error when zero
+ 182: 4090+7	F5F0  E61F    			and	fdc_status_seek_err+fdc_status_track_zero+fdc_status_busy+fdc_status_bit_not_ready+fdc_status_bit_crc_err
+ 183: 4097+7+5	F5F2  2061    			jr	nz,sk_err
+ 184:				
+ 185:				
+ 186:     -	F5F4          		.fd_read_boot:
+ 187:						; read the bootstrap code from track zero of the floppy (single density)
+ 188: 4104+10	F5F4  21000E  			ld	hl,fd_load_addr			; HL = buffer
+ 189: 4114+10	F5F7  11281A  			ld	de,(fd_load_sector_count*256)+fd_retry_count
+ 190:											; D = sector count
+ 191:											; E = retry count
+ 192: 4124+10	F5FA  010180  			ld	bc,(fd_load_sector_size*256)+1	; B = sector size (128)
+ 193:											; C = sector number (1)
+ 194:				
+ 195:						; ld	a,fdc_cmd_read_sector	; keep an FDC read command in A'
+ 196:						; ex	af,af'
+ 197:				
+ 198:     -	F5FD          		.fd_read_sector:
+ 199: 4134+11	F5FD  E5      			push	hl			; save copies of the arguments
+ 200: 4145+11	F5FE  D5      			push	de
+ 201: 4156+11	F5FF  C5      			push	bc
+ 202:				
+ 203: 4167+17	F600  CD70F1  			call	fdc_terminate_cmd	; ensure that FDC is ready for a cmd
+ 204:				
+ 205: 4184+4	F603  79      			ld	a,c			; give FDC the sector number
+ 206: 4188+11	F604  D3E6    			out	(fdc_sector_reg),a
+ 207:				
+ 208:						; ex	af,af'			; give FDC command from A'
+ 209: 4199+7	F606  3E80    			ld	a,fdc_cmd_read_sector
+ 210: 4206+11	F608  D3E4    			out	(fdc_cmd_reg),a
+ 211:						; ex	af,af'
+ 212:				
+ 213: 4217+17	F60A  CDBBF6  			call	fd_wait_busy
+ 214:				
+ 215:						; call	delay_bc_5		; delay by 135 t-states (33.75us @4MHz)
+ 216:						; pop	bc			; get original sector size, number back
+ 217:						; push	bc
+ 218:				
+ 219: 4234+7	F60D  0EE7    			ld	c,fdc_data_reg		; prepare for ini instruction
+ 220:				
+ 221:     -	F60F          		.fd_read_data_loop:
+ 222: 4241+11	F60F  DBE4    			in	a,(fdc_status_reg)	; is DRQ set
+ 223: 4252+8	F611  CB4F    			bit	fdc_status_bit_drq,a
+ 224: 4260+7+5	F613  2804    			jr	z,.fd_read_data_no_drq	; no, make sure we're still busy
+ 225:				
+ 226: 4267+16	F615  EDA2    			ini				; read a byte into buffer
+ 227: 4283+7+5	F617  2804    			jr	z,.fd_read_data_done	; transfer complete?
+ 228:				
+ 229:     -	F619          		.fd_read_data_no_drq:
+ 230: 4290+8	F619  CB47    			bit	fdc_status_bit_busy,a	; still busy
+ 231: 4298+7+5	F61B  20F2    			jr	nz,.fd_read_data_loop	;   yes, continue reading
+ 232:				
+ 233:						; read command data transfer complete
+ 234:     -	F61D          		.fd_read_data_done:
+ 235: 4305+10	F61D  C1      			pop	bc			; restore original sector, sector count
+ 236: 4315+10	F61E  D1      			pop	de			; etc.
+ 237:				
+ 238: 4325+11	F61F  DBE4    			in	a,(fdc_status_reg)	; any errors?
+ 239: 4336+7	F621  E61C    			and	$1C
+ 240: 4343+7+5	F623  2806    			jr	z,.fd_read_ok		; no
+ 241:				
+ 242:						; read error
+ 243: 4350+10	F625  E1      			pop	hl			; restore original buffer pointer
+ 244: 4360+4	F626  1D      			dec	e			; any retries left?
+ 245: 4364+7+5	F627  20D4    			jr	nz,.fd_read_sector	; yes, go do it agin
+ 246:				
+ 247:						; read fail - retries exhausted
+ 248: 4371+12	F629  182F    			jr	rd_err
+ 249:				
+ 250:     -	F62B          		.fd_read_ok:
+ 251: 4383+10	F62B  F1      			pop	af			; discard original buffer pointer
+ 252: 4393+4	F62C  0C      			inc	c			; increment sector number
+ 253: 4397+7	F62D  1E28    			ld	e,fd_retry_count	; restore retry count
+ 254: 4404+4	F62F  15      			dec	d			; decrement sector count
+ 255: 4408+7+5	F630  20CB    			jr	nz,.fd_read_sector	; if more sectors, loop
+ 256:				
+ 257: 4415+10	F632  21F8F6  			ld	hl,fd_boot_sig_0
+ 258: 4425+10	F635  110010  			ld	de,$1000
+ 259: 4435+7	F638  0604    			ld	b,fd_boot_sig_0_len
+ 260: 4442+17	F63A  CD82F6  			call	check_disk_signature
+ 261: 4459+7+5	F63D  2020    			jr	nz,rs_err
+ 262:				
+ 263: 4466+10	F63F  2103F7  			ld	hl,fd_boot_sig_1
+ 264: 4476+10	F642  110014  			ld	de,$1400
+ 265: 4486+7	F645  0604    			ld	b,fd_boot_sig_1_len
+ 266: 4493+17	F647  CD82F6  			call	check_disk_signature
+ 267: 4510+7+5	F64A  2013    			jr	nz,rs_err
+ 268:				
+ 269:						; now clear the screen and call the boot code
+ 270: 4517+17	F64C  CDE0F6  			call	boot_clear_screen
+ 271:				
+ 272: 4534+17	F64F  CD0414  			call	fd_boot_sig_1_loc+fd_boot_sig_1_len
+ 273: 4551+10	F652  C30410  			jp	fd_boot_sig_0_loc+fd_boot_sig_0_len
+ 274:				
+ 275:				
+ 276:     -	F655          	sk_err:
+ 277: 4561+10	F655  11534B  			ld	de,'SK'
+ 278: 4571+12	F658  1808    			jr	boot_err_deselect_fd
+ 279:				
+ 280:     -	F65A          	rd_err:
+ 281: 4583+10	F65A  115244  			ld	de,'RD'
+ 282: 4593+12	F65D  1803    			jr	boot_err_deselect_fd
+ 283:				
+ 284:     -	F65F          	rs_err:
+ 285: 4605+10	F65F  115253  			ld	de,'RS'
+ 286:				
+ 287:     -	F662          	boot_err_deselect_fd:
+ 288: 4615+11	F662  F5      			push	af
+ 289: 4626+17	F663  CD70F1  			call	fdc_terminate_cmd
+ 290: 4643+17	F666  CDA2F1  			call	fdc_head_restore
+ 291:				
+ 292: 4660+10	F669  010000  			ld	bc,0
+ 293: 4670+17	F66C  CD7CF6  			call	delay_bc		; delay by 1,703,915 t-states (0.42597875 sec @ 4MHz)
+ 294: 4687+17	F66F  CD70F1  			call	fdc_terminate_cmd
+ 295: 4704+17	F672  CD81F1  			call	fdc_select_none
+ 296: 4721+10	F675  F1      			pop	af
+ 297:				
+ 298: 4731+10	F676  C3AEF5  			jp	show_boot_error
+ 299:				
+ 300:				
+ 301:     -	F679          	delay_bc_5:			; delay by 135 T-states (33.75us @ 4MHz)
+ 302: 4741+10	F679  010500  			ld	bc,5
+ 303:     -	F67C          	delay_bc: 			; delay by BC*26-5+10 T-states (including ret instruction)
+ 304: 4751+6	F67C  0B      			dec	bc
+ 305: 4757+4	F67D  78      			ld	a,b
+ 306: 4761+4	F67E  B1      			or	c
+ 307: 4765+7+5	F67F  20FB    			jr	nz,delay_bc
+ 308: 4772+10	F681  C9      			ret
+ 309:				
+ 310:				
+ 311:				; on entry:
+ 312:				;   HL = pointer to expected signature value constant (ROM)
+ 313:				;   DE = pointer to disk buffer location to check for signature
+ 314:				;   B = byte count
+ 315:				; on return, zero flag set if match, clear if no match
+ 316:     -	F682          	check_disk_signature:
+ 317: 4782+7	F682  1A      			ld	a,(de)
+ 318: 4789+7	F683  BE      			cp	(hl)
+ 319: 4796+5+6	F684  C0      			ret	nz
+ 320: 4801+6	F685  23      			inc	hl
+ 321: 4807+6	F686  13      			inc	de
+ 322: 4813+8+5	F687  10F9    			djnz	check_disk_signature
+ 323: 4821+10	F689  C9      			ret
+ 324:				
+ 325:				
+ 326:				; returns with Z set and hdc_status_reg in A for no error
+ 327:				; returns with Z clear and hdc_error_reg in A for HDC error
+ 328:				; returns with Z clear and $08 in A for timeout
+ 329:     -	F68A          	hd_wait_not_busy:
+ 330: 4831+11	F68A  C5      			push	bc
+ 331: 4842+10	F68B  010000  			ld	bc,0		; retry counter (65536)
+ 332:     -	F68E          		.hd_wait_not_busy_loop:
+ 333: 4852+11	F68E  DBCF    			in	a,(hdc_status_reg)
+ 334: 4863+8	F690  CB7F    			bit	hdc_status_bit_busy,a
+ 335: 4871+7+5	F692  2004    			jr	nz,.hd_busy
+ 336: 4878+8	F694  CB67    			bit	hdc_status_bit_seek_complete,a
+ 337: 4886+7+5	F696  200D    			jr	nz,.hd_seek_complete
+ 338:				
+ 339:     -	F698          		.hd_busy:
+ 340: 4893+23	F698  DDE3    			ex	(sp),ix		; short delay
+ 341: 4916+23	F69A  DDE3    			ex	(sp),ix
+ 342: 4939+6	F69C  0B      			dec	bc		; decrement retry counter
+ 343: 4945+4	F69D  78      			ld	a,b		; count expired?
+ 344: 4949+4	F69E  B1      			or	c
+ 345: 4953+7+5	F69F  20ED    			jr	nz,.hd_wait_not_busy_loop	;   no, try again
+ 346: 4960+7	F6A1  F608    			or	$08		; pretend we got an "id not found" error
+ 347: 4967+10	F6A3  C1      			pop	bc
+ 348: 4977+10	F6A4  C9      			ret
+ 349:				
+ 350:     -	F6A5          		.hd_seek_complete:
+ 351: 4987+10	F6A5  C1      			pop	bc
+ 352: 4997+8	F6A6  CB47    			bit	hdc_status_bit_error,a	; any error
+ 353: 5005+5+6	F6A8  C8      			ret	z		; no, return with Z set
+ 354: 5010+11	F6A9  DBC9    			in	a,(hdc_error_reg)
+ 355: 5021+10	F6AB  C9      			ret
+ 356:				
+ 357:     -	F6AC          	fd_wait_ready_d0s0:
+ 358: 5031+7	F6AC  3E4E    			ld	a,fdc_sel_side_0|fdc_sel_dr_0	; select d0s0
+ 359: 5038+11	F6AE  D3EF    			out	(fdc_select_reg),a
+ 360: 5049+7	F6B0  0600    			ld	b,0				; short delay for FDC to respond
+ 361: 5056+8+5	F6B2  10FE    		.dly1:	djnz	.dly1
+ 362:     -	F6B4          	fd_wait_ready:
+ 363: 5064+11	F6B4  DBE4    		.loop:	in	a,(fdc_status_reg)
+ 364: 5075+7	F6B6  E681    			and	$81
+ 365: 5082+7+5	F6B8  20FA    			jr	nz,.loop
+ 366: 5089+10	F6BA  C9      			ret
+ 367:				
+ 368:     -	F6BB          	fd_wait_busy:
+ 369: 5099+11	F6BB  DBE4    			in	a,(fdc_status_reg)
+ 370: 5110+7	F6BD  E601    			and	$01
+ 371: 5117+7+5	F6BF  28FA    			jr	z,fd_wait_busy
+ 372: 5124+10	F6C1  C9      			ret
+ 373:				
+ 374:				
+ 375:				
+ 376:     -	0014          	boot_message_line equ 20
+ 377:     -	FE64          	boot_message_pos equ VBASE+(VLINE*boot_message_line)+36
+ 378:     -	0004          	boot_message_len equ 4
+ 379:     -	F6C2          	show_boot_message:
+ 380: 5134+11	F6C2  D5      			push	de
+ 381:				
+ 382: 5145+10	F6C3  2140FE  			ld	hl,VBASE+(VLINE*boot_message_line)
+ 383: 5155+10	F6C6  014001  			ld	bc,VLINE*4
+ 384: 5165+17	F6C9  CD6EF7  			call	con_clear_area
+ 385:				
+ 386: 5182+10	F6CC  D1      			pop	de
+ 387: 5192+20	F6CD  ED5369FE			ld	(boot_message_pos+boot_message_len+1),de
+ 388:				
+ 389: 5212+10	F6D1  21F8F6  			ld	hl,boot_err_msg+1
+ 390: 5222+10	F6D4  1164FE  			ld	de,boot_message_pos
+ 391: 5232+10	F6D7  010400  			ld	bc,boot_message_len
+ 392: 5242+16+5	F6DA  EDB0    			ldir
+ 393:				
+ 394: 5258+17	F6DC  CD97F7  			call	con_cursor_on
+ 395: 5275+10	F6DF  C9      			ret
+ 396:				
+ 397:     -	F6E0          	boot_clear_screen:
+ 398: 5285+10	F6E0  2100F8  			ld	hl,VBASE
+ 399: 5295+10	F6E3  01F005  			ld	bc,VLINE*19
+ 400: 5305+10	F6E6  C36EF7  			jp	con_clear_area
+ 401:				
+ 402:				
+ 403:     -	F6E9          	hd_boot_end_sig:
+ 404:     -	F6E9  2F2A2045			db	"/* END BOOT */"
+	              4E442042
+	              4F4F5420
+	              2A2F
+ 405:     -	000E          	hd_boot_end_sig_len	equ	$-hd_boot_end_sig
+ 406:				
+ 407:				
+ 408:     -	F6F7          	boot_err_msg:
+ 409:     -	F6F7  20424F4F			db	" BOOT ERROR "
+	              54204552
+	              524F5220
+ 410:     -	000C          	boot_err_msg_len	equ	$-boot_err_msg
+ 411:				
+ 412:     -	1000          	fd_boot_sig_0_loc	equ	$1000
+ 413:     -	F6F8          	fd_boot_sig_0		equ	boot_err_msg+1
+ 414:     -	0004          	fd_boot_sig_0_len	equ	4
+ 415:				
+ 416:     -	1400          	fd_boot_sig_1_loc	equ	$1400
+ 417:     -	F703          	fd_boot_sig_1:
+ 418:     -	F703  44494147			db	"DIAG"
+ 419:     -	0004          	fd_boot_sig_1_len	equ	$-fd_boot_sig_1
+ 420:				
+**** trs80m12diagcpm.asm ****
+ 833:				.include "inc/spt.asm"
+**** inc/spt.asm ****
+   1:				; code: lang=asm-collection tabSize=8
+   2:				; spt_ld_bc:	pop 	bc
+   3:				; 		ret
+   4:				
+   5:				; spt_ld_hl:	pop 	hl
+   6:				; 		ret
+   7:				
+   8:     -	F707          	spt_select_test:
+   9: 5315+14	F707  FDE1    			pop	iy
+  10: 5329+10	F709  C9      			ret
+  11:				
+  12:				; spt_ld_bchl:	pop 	bc
+  13:				; 		pop 	hl
+  14:				; 		ret
+  15:				
+  16:				; spt_clr_e:	ld	e,0		; just clear reg e
+  17:				; 		ret
+  18:				
+  19:				
+  20:     -	F70A          	spt_exit:	
+  21:     -	F70A          			SPTHREAD_RESTORE
+  21: 5339+4	F70A  D9      			exx
+  21: 5343+6	F70B  F9      			ld	sp,hl		; resume from the thread location saved in hl'
+  21: 5349+4	F70C  EB      			ex	de,hl
+  21: 5353+4	F70D  D9      			exx
+  21:     -	F70E          	.endm
+  22: 5357+10	F70E  C9      			ret
+  23:				
+  24:				
+  25: 5367+10	F70F  E1      	spt_jp:		pop	hl
+  26: 5377+6	F710  F9      			ld	sp,hl
+  27: 5383+10	F711  C9      			ret
+  28:				
+  29: 5393+10	F712  E1      	spt_jp_nc:	pop	hl
+  30: 5403+5+6	F713  D8      			ret	c
+  31: 5408+6	F714  F9      			ld	sp,hl
+  32: 5414+10	F715  C9      			ret
+  33:				
+  34: 5424+10	F716  E1      	spt_jp_c:	pop	hl
+  35: 5434+5+6	F717  D0      			ret	nc
+  36: 5439+6	F718  F9      			ld	sp,hl
+  37: 5445+10	F719  C9      			ret
+  38:				
+  39:				; spt_jp_z:	pop	hl
+  40:				; 		ret	nz
+  41:				; 		ld	sp,hl
+  42:				; 		ret
+  43:				
+  44:				
+  45:				
+  46:				; ; attempt to create subroutine to replace SPTHREAD_ENTER macro
+  47:				; ; the downside of these is that they destroy HL, which is a hard pill to swallow in
+  48:				; ; ramless code
+  49:				; ; notes:
+  50:				; ; if a subroutine immediately JP's here, we know that:
+  51:				; ;	(sp-2) contains the address of the routine that called us (because we got there by RET)
+  52:				; ;	(sp-2)+3 contains the address we can jp back to in order to continue
+  53:				; spt_enter:
+  54:				; 		dec	sp
+  55:				; 		dec	sp
+  56:				; 		pop	hl
+  57:				; 		SPTHREAD_ENTER
+  58:				; 		jp	(hl)
+  59:				
+  60:				
+  61:				; call an all-threaded subroutine
+  62:				;	the parameter (pointed by SP) is where we are jumping
+  63:     -	F71A          	spt_call:
+  64: 5455+10	F71A  E1      			pop	hl
+  65:     -	F71B          			SPTHREAD_SAVE
+  65: 5465+4	F71B  D9      			exx
+  65: 5469+4	F71C  08      			ex	af,af'		; save flags because of the add hl,sp instruction
+  65: 5473+4	F71D  EB      			ex	de,hl
+  65: 5477+10	F71E  210000  			ld	hl,0		; copy old sp to iy
+  65: 5487+11	F721  39      			add	hl,sp
+  65: 5498+4	F722  08      			ex	af,af'
+  65: 5502+4	F723  D9      			exx
+  65:     -	F724          	.endm
+  66: 5506+6	F724  F9      			ld	sp,hl
+**** trs80m12diagcpm.asm ****
+ 834: 5512+10	F725  C9      			ret
+ 835:				.include "inc/trs80m2con.asm"
+**** inc/trs80m2con.asm ****
+   1:				; code: language=asm-collection tabSize=8
+   2:				
+   3:				
+   4: 5522+10	F726  E1      	spt_con_print:	pop hl
+   5:     -	F727          	con_print:
+   6:     -	F727          		.loop:
+   7: 5532+7	F727  7E      			ld a,(HL)       ; get message char
+   8: 5539+4	F728  B7      			or a            ; test for null
+   9: 5543+7+5	F729  2808    			jr z, .done     ; return if done
+  10: 5550+19	F72B  DD7700  			ld (ix+0),A     ; store char
+  11: 5569+10	F72E  DD23    			inc ix          ; advance screen pointer
+  12: 5579+6	F730  23      			inc hl          ; advance message pointer
+  13: 5585+12	F731  18F4    			jr .loop        ; continue
+  14:     -	F733          		.done:
+  15: 5597+10	F733  C9      			ret
+  16:				
+  17:				mac_con_printc macro reg
+  18:						ld (ix+0), reg
+  19:						inc ix
+  20:				endm
+  21:				
+  22:				mac_itoh_nybble macro
+  23:						or $F0
+  24:						daa
+  25:						add a, $A0
+  26:						adc a, $40
+  27:				endm
+  28:				
+  29:				; mac_con_printx macro
+  30:				; 		ld b,a			; save a copy of the number to convert
+  31:				; 		rra			; get upper nybble
+  32:				; 		rra
+  33:				; 		rra
+  34:				; 		rra
+  35:				; 		mac_itoh_nybble		; convert to ascii
+  36:				; 		mac_con_printc a
+  37:				; 		ld a,b			; fetch lower nybble
+  38:				; 		mac_itoh_nybble		; convert to ascii
+  39:				; 		mac_con_printc a
+  40:				; endm
+  41:				
+  42:     -	F734          	con_printx:
+  43: 5607+4	F734  47      			ld b,a			; save a copy of the number to convert
+  44: 5611+4	F735  1F      			rra			; get upper nybble
+  45: 5615+4	F736  1F      			rra
+  46: 5619+4	F737  1F      			rra
+  47: 5623+4	F738  1F      			rra
+  48:     -	F739          			mac_itoh_nybble		; convert to ascii
+  48: 5627+7	F739  F6F0    			or $F0
+  48: 5634+4	F73B  27      			daa
+  48: 5638+7	F73C  C6A0    			add a, $A0
+  48: 5645+7	F73E  CE40    			adc a, $40
+  48:     -	F740          	endm
+  49:     -	F740          			mac_con_printc a
+  49: 5652+19	F740  DD7700  			ld (ix+0), a
+  49: 5671+10	F743  DD23    			inc ix
+  49:     -	F745          	endm
+  50: 5681+4	F745  78      			ld a,b			; fetch lower nybble
+  51:     -	F746          	con_printh:	mac_itoh_nybble		; convert to ascii
+  51: 5685+7	F746  F6F0    			or $F0
+  51: 5692+4	F748  27      			daa
+  51: 5696+7	F749  C6A0    			add a, $A0
+  51: 5703+7	F74B  CE40    			adc a, $40
+  51:     -	F74D          	endm
+  52:     -	F74D          			mac_con_printc a
+  52: 5710+19	F74D  DD7700  			ld (ix+0), a
+  52: 5729+10	F750  DD23    			inc ix
+  52:     -	F752          	endm
+  53: 5739+10	F752  C9      			ret
+  54:				
+  55:				
+  56: 5749+14	F753  DD2100F8	con_home:	ld ix,VBASE
+  57: 5763+10	F757  C9      			ret
+  58:				
+  59: 5773+14	F758  DDE1    	spt_con_goto:	pop ix
+  60: 5787+10	F75A  C9      			ret
+  61:				
+  62:     -	F75B          	con_NL:
+  63: 5797+8	F75B  DD7D    			ld a,ixl		; go to beginning of line
+  64: 5805+7	F75D  E6C0    			and $c0			; then go to the next line
+  65: 5812+7	F75F  C640    			add a,$40
+  66: 5819+8	F761  DD6F    			ld ixl,a		; store the low byte back
+  67: 5827+7+5	F763  3002    			jr nc,.skip
+  68: 5834+8	F765  DD24    			inc ixh			; fix up high byte if there was a carry
+  69:     -	F767          		.skip:
+  70: 5842+10	F767  C9      			ret
+  71:				
+  72:     -	F768          	con_clear:
+  73: 5852+10	F768  2100F8  			ld hl,VBASE
+  74: 5862+10	F76B  010008  			ld bc,VSIZE
+  75:     -	F76E          	con_clear_area:
+  76:     -	F76E          		.loop:
+  77: 5872+10	F76E  3620    			ld (hl),20h
+  78: 5882+16	F770  EDA1    			cpi
+  79: 5898+10	F772  EA6EF7  			jp pe,.loop
+  80:				
+  81: 5908+14	F775  DD2100F8			ld ix,VBASE
+  82: 5922+10	F779  C9      			ret
+  83:				
+  84: 5932+10	F77A  C1      	spt_con_index:	pop bc
+  85:     -	F77B          	con_index:
+  86: 5942+15	F77B  DD09    			add ix,bc
+  87: 5957+10	F77D  C9      			ret
+  88:				
+  89:				
+  90:				; vram_unmap:
+  91:				; 		ld	a,$00		; disable video memory access
+  92:				; 		jr	vram_apply
+  93:				
+  94:     -	F77E          	vram_map:
+  95: 5967+7	F77E  3E80    			ld	a,$80		; enable video memory access
+  96: 5974+11	F780  D3FF    	vram_apply:	out	($FF),a
+  97: 5985+10	F782  C9      			ret
+  98:				
+  99:				
+ 100:     -	F783          	crtc_setup_table:
+ 101:     -	F783  63      			db $63			; $0: Horizontal Total = 99
+ 102:     -	F784  50      			db $50			; $1: Horizontal Displayed = 80
+ 103:     -	F785  55      			db $55			; $2: H Sync Position = 85
+ 104:     -	F786  08      			db $08			; $3: Sync Width = 8
+ 105:     -	F787  19      			db $19			; $4: Vertical Total = 25
+ 106:     -	F788  00      			db $00			; $5: V Total Adjust = 0
+ 107:     -	F789  18      			db $18			; $6: Vertical Displayed = 24
+ 108:     -	F78A  18      			db $18			; $7: Vertical Sync Position = 24
+ 109:     -	F78B  00      			db $00			; $8: Interlace Mode and Skew = 0
+ 110:     -	F78C  09      			db $09			; $9: Max Scan Line Address = 9
+ 111:     -	F78D  25      			db 00100101b	; $A:  Cursor Start = 5 (b6:blink on, b5=blink period ct)
+ 112:     -	F78E  09      			db $09			; $B: Cursor End = 9
+ 113:     -	F78F  00      			db $00			; $C: Start Address H = 0
+ 114:     -	F790  00      			db $00			; $D: Start Address L = 0
+ 115:						; db high ((VLINE*12)+39)	; $E: Cursor H (HL = $3E9)
+ 116:						; db low ((VLINE*12)+39)	; $F: Cursor L (decimal 1001, center of screen)
+ 117:     -	F791  06      			db high ((VLINE*21)+39)	; $E: Cursor H (HL = $3E9)
+ 118:     -	F792  B7      			db low ((VLINE*21)+39)	; $F: Cursor H (decimal 1001, center of screen)
+ 119:     -	0010          	crtc_setup_len equ $-crtc_setup_table
+ 120:				
+ 121:				
+ 122:     -	F793          	con_cursor_off:
+ 123: 5995+7	F793  1625    			ld	d,00100101b
+ 124: 6002+12	F795  1802    			jr	con_cursor_set
+ 125:     -	F797          	con_cursor_on:
+ 126: 6014+7	F797  1665    			ld	d,01100101b	; turn on the cursor
+ 127:     -	F799          	con_cursor_set:
+ 128: 6021+10	F799  01FC0A  			ld	bc,$0AFC	; point at the CRTC address port
+ 129: 6031+12	F79C  ED41    			out	(c),b		; select the cursor control register
+ 130: 6043+4	F79E  0C      			inc	c		; point at the CRTC data port
+ 131: 6047+7	F79F  0665    			ld	b,01100101b	; turn on the cursor
+ 132: 6054+12	F7A1  ED51    			out	(c),d
+ 133: 6066+10	F7A3  C9      			ret
+ 134:				
+ 135:     -	F7A4          	con_clear_kbd:
+ 136: 6076+7	F7A4  16C8    			ld	d,200
+ 137:     -	F7A6          		.loop:
+ 138: 6083+11	F7A6  DBFF    			in	a,(nmi_status_reg)
+ 139: 6094+8	F7A8  CB7F    			bit	nmi_status_bit_kbd_int,a
+ 140: 6102+7+5	F7AA  2802    			jr	z,.no_key
+ 141: 6109+11	F7AC  DBFC    			in	a,(kbd_data_reg)
+ 142:     -	F7AE          		.no_key:
+ 143: 6120+7	F7AE  0600    			ld	b,0
+ 144: 6127+8+5	F7B0  10FE    		.delay:	djnz	.delay
+ 145:						; ld	bc,128
+ 146:						; call	delay_bc		; delay by 3333 t-states (833.25us @ 4MHz)
+ 147: 6135+4	F7B2  15      			dec	d
+ 148: 6139+7+5	F7B3  20F1    			jr	nz,.loop
+ 149: 6146+10	F7B5  C9      			ret
+ 150:				
+ 151:				; con_get_key:
+ 152:				; 		in	a,(nmi_status_reg)
+ 153:				; 		bit	nmi_status_bit_kbd_int,a
+ 154:				; 		jr	z,.nokey
+ 155:				; 		; xor	$80
+ 156:				; 		; bit	nmi_status_bit_kbd_int,a
+ 157:				; 		; jr	nz,.nokey
+ 158:				; 		in	a,(kbd_data_reg)
+ 159:				; 		ret
+ 160:				; 	.nokey: sub	a
+ 161:				; 		ret
+ 162:				
+ 163:				; spt_check_key:
+ 164:				; 		pop	bc
+ 165:				; 		cp	c
+ 166:				; 		ret
+ 167:				
+ 168:				; spt_jp_z:
+ 169:				; 		pop	hl
+ 170:				; 		ret	nz
+ 171:				; 		ld	sp,hl
+ 172:				; 		ret
+**** trs80m12diagcpm.asm ****
+ 836:				; include "inc/trs80m2music.asm"
+ 837:				
+ 838:     -	F7B6          	end:
+ 839:     -	F000          	                .end    start
+
+
+
+Statistics:
+
+     5	passes
+     0	jr promotions
+   397	symbols
+  1974	bytes
+
+   112	macro calls
+  1536	macro bytes
+    10	invented symbols
+
+
+
+Symbol Table:
+
+.?a0000$3       F01B      61467
+.?a0005$47      F291      62097
+.absent$11      F129      61737
+.absent$44      F264      62052
+.allbad$80      F483      62595
+.bank_cont$3    F085      61573
+.bank_dup$3     F08D      61581
+.bank_loop$3    F075      61557
+.bank_ok$8      F0DF      61663
+.bank_test$3    F077      61559
+.cancel$4       F0C5      61637
+.charloop$53    F2E4      62180
+.cont$45        F27B      62075
+.delay$148      F7B0      63408
+.delay$19       F17A      61818
+.dly1$117       F6B2      63154
+.dly1$22        F18B      61835
+.dly1$24        F196      61846
+.done$132       F733      63283
+.done$18        F16E      61806
+.done$9         F0FD      61693
+.dup$9          F100      61696
+.fd_read_boot$108 F5F4      62964
+.fd_read_data_done$108 F61D      63005
+.fd_read_data_loop$108 F60F      62991
+.fd_read_data_no_drq$108 F619      63001
+.fd_read_ok$108 F62B      63019
+.fd_read_sector$108 F5FD      62973
+.fd_wait_ready$108 F5DA      62938
+.hd_busy$116    F698      63128
+.hd_is_ready$103 F54A      62794
+.hd_read_sector$103 F56D      62829
+.hd_seek_complete$116 F6A5      63141
+.hd_wait_for_drq$103 F57F      62847
+.hd_wait_not_busy_loop$116 F68E      63118
+.hd_wait_ready$103 F539      62777
+.long$47        F2A1      62113
+.loop$118       F6B4      63156
+.loop$132       F727      63271
+.loop$139       F76E      63342
+.loop$148       F7A6      63398
+.loop$18        F160      61792
+.loop$2         F00D      61453
+.loop$43        F24F      62031
+.no_key$148     F7AE      63406
+.off$47         F2A5      62117
+.redo$80        F477      62583
+.send$33        F1E2      61922
+.showbit$45     F26E      62062
+.silp$24        F190      61840
+.skip$137       F767      63335
+.spin$107       F5C8      62920
+.start$19       F170      61808
+.table_done$3   F09B      61595
+.test55$9       F0F0      61680
+.test_0000$3    F061      61537
+.test_4000$3    F053      61523
+.test_banked$3  F071      61553
+.vram_bad$3     F02F      61487
+.vram_ok$3      F037      61495
+.wrdy1$24       F198      61848
+.zero$45        F277      62071
+COL1           =02        2
+COL2           =2A        42
+CONTINUE_ON_VRAM_ERROR=00        0
+JP_ERROR       =00        0
+JR_PROMOTE     =00        0
+SIMULATE_ERROR =00        0
+TP_BANK        =02        2
+TP_BASE        =01        1
+TP_GOTO        =01        1
+TP_LABEL       =03        3
+TP_POS         =04        4
+TP_SIZE        =00        0
+VBASE          =F800      63488
+VLINE          =50        80
+VSIZE          = 800      2048
+add_hl_bc       F229      61993
+boot_clear_screen F6E0      63200
+boot_err_deselect_fd F662      63074
+boot_err_msg    F6F7      63223
+boot_err_msg_len=0C        12
+boot_error_pos =FEAD      65197
+boot_fd0        F5CA      62922
+boot_hd0        F52A      62762
+boot_message_len=04        4
+boot_message_line=14        20
+boot_message_pos=FE64      65124
+charset_here    F2E4      62180
+chartest_fullscreen F2DE      62174
+check_boot_keys F09F      61599
+check_disk_signature F682      63106
+checkabsent     F46F      62575
+con_NL          F75B      63323
+con_clear       F768      63336
+con_clear_area  F76E      63342
+con_clear_kbd   F7A4      63396
+con_cursor_off  F793      63379
+con_cursor_on   F797      63383
+con_cursor_set  F799      63385
+con_home        F753      63315
+con_index       F77B      63355
+con_print       F727      63271
+con_printh      F746      63302
+con_printx      F734      63284
+crtc_addr_reg  =FC        252
+crtc_cursor_bit_blink_enable=06        6
+crtc_cursor_bit_blink_slow=05        5
+crtc_cursor_blink_enable=40        64
+crtc_cursor_blink_slow=20        32
+crtc_data_reg  =FD        253
+crtc_setup_len =10        16
+crtc_setup_table F783      63363
+ctc_bit_control=00        0
+ctc_bit_reset  =01        1
+ctc_control    =01        1
+ctc_reg        =F0        240
+ctc_reset      =02        2
+dec_hl          F22B      61995
+delay_bc        F67C      63100
+delay_bc_5      F679      63097
+dma_cmd_reset  =C3        195
+dma_reg        =F8        248
+end             F7B6      63414
+fd_boot_sig_0  =F6F8      63224
+fd_boot_sig_0_len=04        4
+fd_boot_sig_0_loc=1000      4096
+fd_boot_sig_1   F703      63235
+fd_boot_sig_1_len=04        4
+fd_boot_sig_1_loc=1400      5120
+fd_load_addr   = E00      3584
+fd_load_sector_count=1A        26
+fd_load_sector_size=80        128
+fd_retry_count =28        40
+fd_stack_init  =2000      8192
+fd_wait_busy    F6BB      63163
+fd_wait_ready   F6B4      63156
+fd_wait_ready_d0s0 F6AC      63148
+fdc_cmd_force_int=D0        208
+fdc_cmd_force_int_immediate=08        8
+fdc_cmd_force_int_index=04        4
+fdc_cmd_force_int_not_ready=02        2
+fdc_cmd_force_int_ready=01        1
+fdc_cmd_head_load=08        8
+fdc_cmd_read_address=C0        192
+fdc_cmd_read_sector=80        128
+fdc_cmd_read_track=E0        224
+fdc_cmd_reg    =E4        228
+fdc_cmd_restore=00        0
+fdc_cmd_seek   =10        16
+fdc_cmd_step   =20        32
+fdc_cmd_step_in=40        64
+fdc_cmd_step_out=60        96
+fdc_cmd_step_rate_10ms=02        2
+fdc_cmd_step_rate_15ms=03        3
+fdc_cmd_step_rate_3ms=00        0
+fdc_cmd_step_rate_6ms=01        1
+fdc_cmd_update_track=10        16
+fdc_cmd_verify_track=04        4
+fdc_cmd_write_sector=A0        160
+fdc_cmd_write_track=F0        240
+fdc_data_reg   =E7        231
+fdc_head_restore F1A2      61858
+fdc_pio_reg    =E0        224
+fdc_reset_reg  =E8        232
+fdc_sector_reg =E6        230
+fdc_sel_dr_0   =0E        14
+fdc_sel_dr_1   =0D        13
+fdc_sel_dr_2   =0B        11
+fdc_sel_dr_3   =07        7
+fdc_sel_dr_none=0F        15
+fdc_sel_mfm    =80        128
+fdc_sel_side_0 =40        64
+fdc_select      F187      61831
+fdc_select_d0s0 F185      61829
+fdc_select_none F181      61825
+fdc_select_reg =EF        239
+fdc_status_bit_busy=00        0
+fdc_status_bit_crc_err=03        3
+fdc_status_bit_deleted_data=05        5
+fdc_status_bit_drq=01        1
+fdc_status_bit_head_loaded=05        5
+fdc_status_bit_index=01        1
+fdc_status_bit_lost_data=02        2
+fdc_status_bit_not_ready=07        7
+fdc_status_bit_rec_not_found=04        4
+fdc_status_bit_seek_err=04        4
+fdc_status_bit_track_zero=02        2
+fdc_status_bit_write_fault=05        5
+fdc_status_bit_write_protected=06        6
+fdc_status_busy=01        1
+fdc_status_crc_err=08        8
+fdc_status_deleted_data=20        32
+fdc_status_drq =02        2
+fdc_status_head_loaded=20        32
+fdc_status_index=02        2
+fdc_status_lost_data=04        4
+fdc_status_not_ready=80        128
+fdc_status_rec_not_found=10        16
+fdc_status_reg =E4        228
+fdc_status_seek_err=10        16
+fdc_status_track_zero=04        4
+fdc_status_write_fault=20        32
+fdc_status_write_protected=40        64
+fdc_step_in     F190      61840
+fdc_step_in_5   F18E      61838
+fdc_terminate_cmd F170      61808
+fdc_track_reg  =E5        229
+hd_boot_end_sig F6E9      63209
+hd_boot_end_sig_len=0E        14
+hd_err_from_err_reg F5AB      62891
+hd_err_no_sig   F5A5      62885
+hd_load_addr   =00        0
+hd_stack_init  =2800      10240
+hd_tr0_not_found F5AB      62891
+hd_wait_not_busy F68A      63114
+hdc_command_format_track=50        80
+hdc_command_read_sector_dma=28        40
+hdc_command_read_sector_pio=20        32
+hdc_command_reg=CF        207
+hdc_command_restore=10        16
+hdc_command_seek=70        112
+hdc_command_step_rate_1p5_ms=03        3
+hdc_command_step_rate_7p5_ms=0F        15
+hdc_command_write_sector=30        48
+hdc_control_deven=08        8
+hdc_control_dma_enable=01        1
+hdc_control_intrq_enable=02        2
+hdc_control_reg=C1        193
+hdc_control_soft_int=40        64
+hdc_control_soft_reset=10        16
+hdc_control_wait_enable=04        4
+hdc_cylinder_high_reg=CD        205
+hdc_cylinder_low_reg=CC        204
+hdc_data_reg   =C8        200
+hdc_drive_id_45=C2        194
+hdc_drive_id_67=C3        195
+hdc_error_bit_aborted_cmd=02        2
+hdc_error_bit_bad_block=07        7
+hdc_error_bit_crc_data=06        6
+hdc_error_bit_crc_id=05        5
+hdc_error_bit_data_mark_not_found=00        0
+hdc_error_bit_id_not_found=04        4
+hdc_error_bit_track_0_not_found=01        1
+hdc_error_reg  =C9        201
+hdc_sdh_sect_size_128=60        96
+hdc_sdh_sect_size_256=00        0
+hdc_sdh_sect_size_512=20        32
+hdc_sector_count_reg=CA        202
+hdc_sector_number_reg=CB        203
+hdc_size_drive_head_reg=CE        206
+hdc_status_bit_busy=07        7
+hdc_status_bit_command_in_progress=01        1
+hdc_status_bit_data_request=03        3
+hdc_status_bit_error=00        0
+hdc_status_bit_ready=06        6
+hdc_status_bit_seek_complete=04        4
+hdc_status_bit_write_fault=05        5
+hdc_status_reg =CF        207
+hdc_write_precomp_reg=C9        201
+hdc_write_protect_bit_hdwpl=06        6
+hdc_write_protect_bit_intrq=07        7
+hdc_write_protect_reg=C0        192
+init_crtc       F007      61447
+inverse        =80        128
+kbd_data_reg   =FC        252
+key_break      =03        3
+key_escape     =1B        27
+label_bank16    F300      62208
+label_dram16    F2F6      62198
+label_vram      F2EC      62188
+labels_start    F2EC      62188
+ld_a_e          F12B      61739
+ld_a_h          F225      61989
+ld_a_l          F227      61991
+ld_a_tp_bank    F1DB      61915
+ld_bc_tp_size   F1D5      61909
+ld_d_0          F137      61751
+ld_hl_tp_base   F1CF      61903
+ld_hl_tp_label  F1C5      61893
+mark_bank_map_vram F10E      61710
+max_rom_size   =1000      4096
+memtestmarch    F46C      62572
+memtestmarch_end=F52A      62762
+msg_absent      F367      62311
+msg_banner      F30E      62222
+msg_biterrs     F35E      62302
+msg_dash        F30A      62218
+msg_dup         F370      62320
+msg_skipped     F355      62293
+msg_space       F30C      62220
+msg_testing     F377      62327
+msg_testok      F34C      62284
+mtm1            F487      62599
+mtm1_bounce     F4CD      62669
+mtm1loop        F490      62608
+mtm2            F497      62615
+mtm2cont        F4A8      62632
+mtm2loop        F4A0      62624
+mtm3            F4B0      62640
+mtm3cont        F4C2      62658
+mtm3loop        F4B9      62649
+mtm4            F4CF      62671
+mtm4cont        F4E2      62690
+mtm4loop        F4DA      62682
+mtm5            F4EA      62698
+mtm5cont        F4FE      62718
+mtm5loop        F4F5      62709
+mtm6            F505      62725
+mtm6cont        F518      62744
+mtm6loop        F510      62736
+mtm_done        F525      62757
+mtm_done_bounce F4CB      62667
+mtm_return      F527      62759
+mtmredo         F51E      62750
+nmi_ram_dis_video=40        64
+nmi_ram_en_40_col=10        16
+nmi_ram_en_rtc_int=20        32
+nmi_ram_en_video_ram=80        128
+nmi_ram_reg    =FF        255
+nmi_status_bit_40_col=04        4
+nmi_status_bit_dis_video=06        6
+nmi_status_bit_kbd_int=07        7
+nmi_status_bit_rtc_int_en=05        5
+nmi_status_reg =FF        255
+pause_bc        F24E      62030
+print_biterrs   F26A      62058
+ram_size       =8000      32768
+ram_start      =00        0
+rd_err          F65A      63066
+reloc_dst_begin F455      62549
+reloc_size     =D5        213
+reloc_src_begin F455      62549
+relocate_memtest F449      62537
+relocated_memtest F46C      62572
+rlc_e           F281      62081
+rom_en_reg     =F9        249
+rom_map         F461      62561
+rom_start      =00        0
+rom_unmap       F45D      62557
+rs_err          F65F      63071
+rtc_reg        =FE        254
+screen_size    = 800      2048
+screen_start   =F800      63488
+show_boot_error F5AE      62894
+show_boot_message F6C2      63170
+sio_cmd_channel_reset=18        24
+sio_ctl_reg    =F6        246
+sio_data_reg   =F4        244
+sk_err          F655      63061
+spt_blink_bit_rl F284      62084
+spt_boot_fd     F0CD      61645
+spt_boot_hd     F0CB      61643
+spt_call        F71A      63258
+spt_charset_64_p16 F2D5      62165
+spt_charset_64_p16_start F2D1      62161
+spt_con_goto    F758      63320
+spt_con_index   F77A      63354
+spt_con_print   F726      63270
+spt_dec_d_jp_nz F13A      61754
+spt_exit        F70A      63242
+spt_jp          F70F      63247
+spt_jp_bank_dup F0E5      61669
+spt_jp_boot_cancelled F105      61701
+spt_jp_c        F716      63254
+spt_jp_e_ff     F1BE      61886
+spt_jp_e_zero   F1B7      61879
+spt_jp_fdc_ready F13F      61759
+spt_jp_hd_present F14B      61771
+spt_jp_nc       F712      63250
+spt_pause       F24D      62029
+spt_select_test F707      63239
+spt_tp_goto     F1E5      61925
+spt_tp_next     F1F0      61936
+sptc_announcetest F209      61961
+sptc_bank_report F0D1      61649
+sptc_bank_test_and_report F0CF      61647
+sptc_blink_biterrs F2AD      62125
+sptc_fdc_reset_head F1A7      61863
+sptc_fdc_terminate_ready_timeout F15E      61790
+sptc_print_charset F2C7      62151
+sptc_print_errsmsg F25A      62042
+sptc_printbank  F12D      61741
+sptc_relocated_test F455      62549
+sptc_tp_print_range F22D      61997
+start           F000      61440
+status_backup  =08        8
+test_vram       F017      61463
+tp_entrysize   =06        6
+tp_high         F392      62354
+tp_low          F386      62342
+tp_low_reloc    F466      62566
+tp_map_bank     F1DF      61919
+tp_rdest        F38C      62348
+tp_vram         F380      62336
+vram_apply      F780      63360
+vram_map        F77E      63358

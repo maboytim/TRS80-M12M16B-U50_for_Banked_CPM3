@@ -1,4 +1,4 @@
-# TRS80 M12/M16B U50 for Banked CPM3
+# TRS-80 M12/M16B U50 for Banked CPM3
 
 In 1984/1985 Tandy issued [Technical Bulletin 12/16B:18](assets/TB_12-16B-18.pdf) which described an upgrade procedure and kit to support [Banked CPM](https://github.com/pski/model2archive/tree/master/Software/CPM/CPM%20Plus) on TRS-80 model 12 (M12) and model 16B (M16B).  The kit included a replacement for the U50  Memory Controller chip which was a [82S153 PLA](assets/TB_12-16B-18.pdf).  No machines with this upgrade have been found to date and it's unknown if Tandy actually sold any of these kits.  The purpose of this project is to recreate the replacement U50 using a 'modern' GAL device.
 
@@ -30,7 +30,7 @@ When `LOW_PAGE=0` The Tandy mode is selected and when `LOW_PAGE=1` the CPM mode 
 
 ### Tandy Banking
 
-In the Tandy banking mode the common page is mapped **low** and **Page 0** is the common page.  Pages 1-15 are the banking pages.  Since the common page must always be present, Bank 0 must always be present and Page 1 would be for banking.  If a second Bank is present it is typically configured as Bank 7 (Page 14 and Page 15).
+In the Tandy banking mode the common page is mapped **low** and **Page 0** is the common page.  Pages 1-15 are the banking pages.  Since the common page must always be present, Bank 0 must always be present and Page 1 would be for banking.  If a second Bank is present it is typically configured as Bank 7 (Pages 14 and 15).
 
 The common Page 0 is always active in the low half regardless of the value of `MEMCFG[3:0]`.  The behavior when `MEMCFG[3:0]=0` seems to be undefined.
 
@@ -40,7 +40,7 @@ In the CPM banking mode the common page is mapped **high** and **Page 1** is the
 
 Since Banked CPM only makes sense with more than 64k of memory the Tech Bulletin requires a 128k upgrade and the additional Bank is configured as Bank 7 consistent with what is typical for Tandy mode.  Thus the banking Pages are 0,14,15.  The original M2 64k memory card does not implement the `OPSCFG` register (which is which is why the M2 is not supported) so Banked CPM on the M12/M16B is practically limited to 128k.  The Tandy Banked CPM3 is configured for 128k.
 
-The common Page 1 is always active in the high half regardless of the value of MEMCFG[3:0].  The behavior when MEMCFG[3:0]=1 seems to be undefined.
+The common Page 1 is always active in the high half regardless of the value of `MEMCFG[3:0]`.  The behavior when `MEMCFG[3:0]=1` seems to be undefined.
 
 ## Original U50 Design
 
@@ -114,7 +114,7 @@ At this point it's apparent that the original U50 has *some* alternate banking i
 /* LOW_PAGE=0 */
 R0_0 = !LOW_PAGE & ( !MA15 ? 'b'1 : (PAGE1 & !VID) );
 ```
-It's easy to see that this makes sense.  When MA15=0 the common page is selected so the RAM should be enabled regardless of everything else (hence the 'b'1).  When MA15=1 the RAM should be enabled if Page 1 is selected.
+It's easy to see that this makes sense.  When `MA15=0` the common page is selected so the RAM should be enabled regardless of everything else (hence the 'b'1).  When `MA15=1` the RAM should be enabled if Page 1 is selected.
 
 One detail that has been ignored until now is video memory.  Video memory is mapped to F800h-FFFFh when enabled by `MEMCFG[7]` which is the `VIDEO` signal.  So the `!VID` term in the expression just enables or disables the RAM in the region of the video memory depending on the state of `VIDEO`.
 
@@ -147,7 +147,7 @@ It's clearly not right and not even worth trying to rationalize.
 /* LOW_PAGE=0 */
 R1_0 = !LOW_PAGE & MA15 & BANKSEL & !VID & (!MA14 # !K16);
 ```
-Again it's easy to see that this makes sense.  The banked page is the high half so MA15=1, the configured bank must be selected, and video memory must not be enabled.  Another detail that's been ignored until now is that there is an option for a 16k RAM instead of 64k - `K16=0` selects 64k and `K16=1` selects 16k.  Since 16k would make no sense for banked CPM 64k would always be selected (`K16=0`) so the term `(!MA14 # !K16)` can just be ignored.
+Again it's easy to see that this makes sense.  The banked page is the high half so `MA15=1`, the configured bank must be selected, and video memory must not be enabled.  Another detail that's been ignored until now is that there is an option for a 16k RAM instead of 64k - `K16=0` selects 64k and `K16=1` selects 16k.  Since 16k would make no sense for banked CPM 64k would always be selected (`K16=0`) so the term `(!MA14 # !K16)` can just be ignored.
 
 Again, since CPM mode just swaps the common and banked pages in principle all that should be needed is to just invert MA15 to obtain R1_1:
 ```
@@ -240,3 +240,30 @@ The TL866II can also test IC's including custom parts with user defined test vec
 
 If you test the original U50 82S153 with User-M12-U58-V8 for the modified design there will be a few errors corresponding to the changes of the modified design.
 
+## Testing
+
+A hacked version of the [Adrian Black diagnostic ROM](https://github.com/misterblack1/trs80-diagnosticrom) is provided for testing with the actual M12/M16B.  It was hacked to run as a loadable program (vs from ROM) and to test memory in CPM mode and to loop indefinitely instead of reboot.  It can be run from LSDOS or possibly other M2 DOS's.  The result with the modified U50 should be:
+
+![](assets/diagcpm-u50new.jpg)
+
+It should also run with the original U50 but in that case Page 0 will appear as missing:
+
+![](assets/diagcpm-u50orig.jpg)
+
+The hacked diagnostic is [here](source/trs80m12diagcpm).
+
+## The Pudding
+
+As they say the proof is in the pudding.  All of that is moot if it doesn't actually work.  Banked CPM is available [here](https://github.com/pski/model2archive/tree/master/Software/CPM/CPM%20Plus) from Peter Cetinski's Model 2 archive.  And voila...
+
+![](assets/CPMboot.jpg)
+
+And [here](assets/CPMboot.mov) is a video of it actually booting.
+
+## Shout Out
+
+Special thanks to the folks that supported me in this effort:
+
+* Ken Brookner for introducing me this problem and providing details and testing.
+* Aaron Brockbank for dumping the U50 and generating the equations.
+* And especially Amardeep Chana for loaning me his Model 12 mainboard for experimentation and testing.
