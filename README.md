@@ -1,6 +1,6 @@
 # TRS-80 M12/M16B U50 for Banked CPM3
 
-In 1984/1985 Tandy issued [Technical Bulletin 12/16B:18](assets/TB_12-16B-18.pdf) which described an upgrade procedure and kit to support [Banked CPM](https://github.com/pski/model2archive/tree/master/Software/CPM/CPM%20Plus) on TRS-80 model 12 (M12) and model 16B (M16B).  The kit included a replacement for the U50  Memory Controller chip which was a [82S153 PLA](assets/TB_12-16B-18.pdf).  No machines with this upgrade have been found to date and it's unknown if Tandy actually sold any of these kits.  The purpose of this project is to recreate the replacement U50 using a 'modern' GAL device.
+In 1984/1985 Tandy issued [Technical Bulletin 12/16B:18](assets/TB_12-16B-18.pdf) which described an upgrade procedure and kit to support [Banked CPM](https://github.com/pski/model2archive/tree/master/Software/CPM/CPM%20Plus) on TRS-80 Model 12 (M12) and Model 16B (M16B).  The kit included a replacement for the U50  Memory Controller chip which was a [82S153 PLA](assets/TB_12-16B-18.pdf).  No machines with this upgrade have been found to date and it's unknown if Tandy actually sold any of these kits.  The purpose of this project is to recreate the replacement U50 using a 'modern' GAL device.
 
 Tandy labeled their PLA's with a checksum or CRC that identified the device.  The original U50 is labeled A2AF.
 
@@ -26,7 +26,7 @@ The Tandy or CPM model is selected by lsb of the` OPSCFG` register (`OPSCFG[0]`)
 
 ![](assets/OPSCFG.bmp)
 
-When `LOW_PAGE=0` The Tandy mode is selected and when `LOW_PAGE=1` the CPM mode is selected.  LOW_PAGE is cleared to 0 by a hardware reset so Tandy mode is selected by default out of reset.
+When `LOW_PAGE=0` the Tandy mode is selected and when `LOW_PAGE=1` the CPM mode is selected.  LOW_PAGE is cleared to 0 by a hardware reset so Tandy mode is selected by default out of reset.
 
 ### Tandy Banking
 
@@ -103,7 +103,7 @@ CASEN =  !REFRESH & ((R0_0 # R1_0) # (R0_1 # R1_1));
 ```
 Note although the 16V8 is pin compatible with the 82S153 their internal architectures are different so a design for the 82S153 won't necessarily fit a 16V8 - which is unfortunately the case here.  So the design above won't actually compile for a 16V8.  But for now that's not important.
 
-The only output signals of interest here are the DRAM control signals `RASEN0`, `RASEN1`, and `CASEN` so the others can be ignored.  It's readily seen that `CASEN = RASEN0 | RASEN1` so it's really just the *two* signals `RASEN0` and `RASEN1` that are of interest.  As already mentioned `LOW_PAGE` is the signal that selects between the Tandy and CPM modes.  It's also readily seen that `LOW_PAGE` essentially controls a mux that selects between two pairs of signals for `RASEN0` and `RASEN1` - `R0_0` and `R1_0` when `LOW_PAGE=0` (Tandy mode), and `R0_1` and `R1_1` when `LOW_PAGE=1` (CPM mode).
+The only output signals of interest here are the DRAM control signals `RASEN0`, `RASEN1`, and `CASEN` so the others can be ignored.  And it's readily seen that `CASEN = RASEN0 | RASEN1` so it's really just the *two* signals `RASEN0` and `RASEN1` that are of interest.  As already mentioned `LOW_PAGE` is the signal that selects between the Tandy and CPM modes.  It's also readily seen that `LOW_PAGE` essentially controls a mux that selects between two pairs of signals for `RASEN0` and `RASEN1` - `R0_0` and `R1_0` when `LOW_PAGE=0` (Tandy mode), and `R0_1` and `R1_1` when `LOW_PAGE=1` (CPM mode).
 
 At this point it's apparent that the original U50 has *some* alternate banking implementation for `LOW_PAGE=1` mode.  What's not apparent though is whether the original design was intended for something other than CPM banking or if it was intended for CPM banking but has a bug.  But in any case our problem has now been reduced to just the two equations for `R0_1` and `R1_1`.
 
@@ -118,7 +118,7 @@ It's easy to see that this makes sense.  When `MA15=0` the common page is select
 
 One detail that has been ignored until now is video memory.  Video memory is mapped to F800h-FFFFh when enabled by `MEMCFG[7]` which is the `VIDEO` signal.  So the `!VID` term in the expression just enables or disables the RAM in the region of the video memory depending on the state of `VIDEO`.
 
-Since CPM mode just swaps the common and banked pages in principle all that should be needed is just invert MA15 to obtain R0_1:
+Since CPM mode just swaps the common and banked pages in principle all that should be needed is to just invert `MA15` to obtain `R0_1`:
 ```
 /* LOW_PAGE=1 */
 R0_1 = LOW_PAGE & ( MA15 ? 'b'1 : (PAGE1 & !VID) );
@@ -147,9 +147,9 @@ It's clearly not right and not even worth trying to rationalize.
 /* LOW_PAGE=0 */
 R1_0 = !LOW_PAGE & MA15 & BANKSEL & !VID & (!MA14 # !K16);
 ```
-Again it's easy to see that this makes sense.  The banked page is the high half so `MA15=1`, the configured bank must be selected, and video memory must not be enabled.  Another detail that's been ignored until now is that there is an option for a 16k RAM instead of 64k - `K16=0` selects 64k and `K16=1` selects 16k.  Since 16k would make no sense for banked CPM 64k would always be selected (`K16=0`) so the term `(!MA14 # !K16)` can just be ignored.
+Again it's easy to see that this makes sense.  The banked page is the high half (`MA15=1`), the configured bank must be selected (`BANKSEL`), and video memory must not be enabled (`!VID`).  Another detail that's been ignored until now is that there is an option for a 16k RAM instead of 64k - `K16=0` selects 64k and `K16=1` selects 16k.  Since 16k would make no sense for banked CPM 64k would always be selected (`K16=0`) the term `(!MA14 # !K16)` can just be ignored.
 
-Again, since CPM mode just swaps the common and banked pages in principle all that should be needed is to just invert MA15 to obtain R1_1:
+Again, since CPM mode just swaps the common and banked pages in principle all that should be needed is to just invert `MA15` to obtain `R1_1`:
 ```
 /* LOW_PAGE=1 */
 R1_1 = LOW_PAGE & !MA15 & BANKSEL & !VID & (!MA14 # !K16);
@@ -164,7 +164,7 @@ Comparing it to the original expression for R1_1:
 ```
 R1_1 = LOW_PAGE & !MA15 & BANKSEL & !K16;
 ```
-They differ only in the term that involves `K16`.  Since `K16=0` when 64k is installed the two expressions are effectively the same.  We'll just use the original expression since it is simpler.
+They differ only in the term that involves `K16`.  Since `K16=0` when 64k is installed the two expressions are effectively the same.  But I think the modified one seems more correct so we'll use the modified one.
 
 ## Modified U50 Design
 
@@ -217,7 +217,7 @@ R1_0 = !LOW_PAGE &     MA15 &  BANKSEL & !VID & (!MA14 # !K16);
 /* LOW_PAGE=1 */
 R0_1 =  LOW_PAGE & ( (!MA15 &  PAGE0) #
                      ( MA15 &            !VID) );
-R1_1 =  LOW_PAGE &    !MA15 &  BANKSEL & !K16;
+R1_1 =  LOW_PAGE &    !MA15 &  BANKSEL & (!MA14 # !K16);
 
 RASEN0 = !REFRESH & (R0_0 # R0_1);
 RASEN1 = !REFRESH & (R1_0 # R1_1);
@@ -258,7 +258,11 @@ As they say the proof is in the pudding.  All of that is moot if it doesn't actu
 
 ![](assets/CPMboot.jpg)
 
-And [here](assets/CPMboot.mov) is a video of it actually booting.
+And [here](assets/CPMboot.mp4) is a video of it actually booting.
+
+## Other Machines
+
+This is also applicable to at least the Model 6000.  The M6000 has the same mainboard as the M12 but was probably omitted from the Tech Bulletin because the M6000 wasn't promoted as an 8-bit machine.  But if you wanted to try this with a M6000 it should work.
 
 ## Shout Out
 

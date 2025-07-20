@@ -55,7 +55,7 @@ R1_0 = !LOW_PAGE &     MA15 &  BANKSEL & !VID & (!MA14 # !K16);
 /* LOW_PAGE=1 */
 R0_1 =  LOW_PAGE & ( (!MA15 &  PAGE0) #
                      ( MA15 &            !VID) );
-R1_1 =  LOW_PAGE &    !MA15 &  BANKSEL & !K16;
+R1_1 =  LOW_PAGE &    !MA15 &  BANKSEL & (!MA14 # !K16);
 
 RASEN0 = !REFRESH & (R0_0 # R0_1);
 RASEN1 = !REFRESH & (R1_0 # R1_1);
